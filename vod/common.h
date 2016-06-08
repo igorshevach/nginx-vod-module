@@ -16,6 +16,14 @@
 #define vod_div_ceil(x, y) (((x) + (y) - 1) / (y))
 #define vod_array_entries(x) (sizeof(x) / sizeof(x[0]))
 
+#define vod_is_bit_set(mask, index) (((mask)[(index) >> 3] >> ((index) & 7)) & 1)
+#define vod_set_bit(mask, index) (mask)[(index) >> 3] |= 1 << ((index) & 7)
+
+// Note: comparing the pointers since in the case of labels if both were derived by the language, 
+//		they will have the same pointer and we can skip the memcmp
+#define vod_str_equals(l1, l2) \
+	((l1).len == (l2).len && ((l1).data == (l2).data || vod_memcmp((l1).data, (l2).data, (l1).len) == 0))
+
 #ifdef VOD_STAND_ALONE
 
 // includes
@@ -96,6 +104,7 @@ void vod_log_error(vod_uint_t level, vod_log_t *log, int err,
 
 // errors codes
 #define  VOD_OK         NGX_OK
+#define  VOD_DONE       NGX_DONE
 #define  VOD_AGAIN      NGX_AGAIN
 
 #define vod_inline ngx_inline
@@ -121,6 +130,7 @@ void vod_log_error(vod_uint_t level, vod_log_t *log, int err,
 #define vod_strncasecmp(s1, s2, n) ngx_strncasecmp(s1, s2, n)
 #define vod_atoi(str, len) ngx_atoi(str, len)
 #define vod_atofp(str, len, point) ngx_atofp(str, len, point)
+#define vod_pstrdup(pool, src) ngx_pstrdup(pool, src)
 
 // array functions
 #define vod_array_init(array, pool, n, size) ngx_array_init(array, pool, n, size)
@@ -254,6 +264,13 @@ enum {
 	VOD_ERROR_LAST,
 };
 
+typedef struct vod_array_part_s {
+	void* first;
+	void* last;
+	size_t count;
+	struct vod_array_part_s* next;
+} vod_array_part_t;
+
 typedef vod_status_t(*write_callback_t)(void* context, u_char* buffer, uint32_t size);
 
 typedef struct {
@@ -262,9 +279,13 @@ typedef struct {
 	void* context;
 } segment_writer_t;
 
+struct buffer_pool_s;
+typedef struct buffer_pool_s buffer_pool_t;
+
 typedef struct {
 	vod_pool_t* pool;
 	vod_log_t *log;
+	buffer_pool_t* output_buffer_pool;
 	bool_t simulation_only;
 } request_context_t;
 

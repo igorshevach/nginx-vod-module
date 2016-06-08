@@ -2,12 +2,15 @@
 #include <zlib.h>
 #include "mp4_builder.h"
 #include "mp4_decrypt.h"
+#include "mp4_format.h"
 #include "mp4_parser.h"
 #include "mp4_defs.h"
+#include "../media_format.h"
 #include "../input/frames_source_cache.h"
 #include "../read_stream.h"
 #include "../codec_config.h"
 #include "../media_clip.h"
+#include "../segmenter.h"
 #include "../common.h"
 
 // TODO: use iterators from mp4_parser_base.c to reduce code duplication
@@ -24,19 +27,12 @@
 // constants
 #define MAX_FRAMERATE_TEST_SAMPLES (20)
 #define MAX_TOTAL_SIZE_TEST_SAMPLES (100000)
-#define MAX_TRACK_COUNT (1024)
-#define MAX_DURATION_SEC (1000000)
 
-static uint16_t channel_config_to_channel_count[] = {
-	0, // defined in AOT Specific Config
-	1, // front - center
-	2, // front - left, front - right
-	3, // front - center, front - left, front - right
-	4, // front - center, front - left, front - right, back - center
-	5, // front - center, front - left, front - right, back - left, back - right
-	6, // front - center, front - left, front - right, back - left, back - right, LFE - channel
-	8, // front - center, front - left, front - right, side - left, side - right, back - left, back - right, LFE - channel
-};
+// typedefs
+typedef struct {
+	media_base_metadata_t base;		// tracks array is of mp4_track_base_metadata_t
+	uint32_t mvhd_timescale;
+} mp4_base_metadata_t;
 
 // trak atom parsing
 typedef struct {
@@ -61,8 +57,7 @@ typedef struct {
 	media_parse_params_t parse_params;
 	uint32_t track_indexes[MEDIA_TYPE_COUNT];
 	file_info_t* file_info;
-	const u_char* ftyp_buffer;
-	size_t ftyp_size;
+	vod_str_t ftyp_atom;
 	mp4_base_metadata_t* result;
 } process_moov_context_t;
 
@@ -90,10 +85,10 @@ typedef struct {
 	uint32_t dts_shift;
 	uint32_t first_frame;
 	uint32_t last_frame;
+	uint32_t clip_to;
 	uint64_t first_frame_time_offset;
 	int32_t clip_from_frame_offset;
 	input_frame_t* frames;
-	uint64_t* frame_offsets;
 	uint32_t frame_count;
 	uint64_t total_frames_size;
 	uint64_t total_frames_duration;
@@ -166,10 +161,6 @@ typedef struct {
 } raw_atom_mapping_t;
 
 const raw_atom_mapping_t raw_atom_mapping[] = {
-	{ RTA_TKHD, offsetof(trak_atom_infos_t, tkhd) },
-	{ RTA_HDLR, offsetof(trak_atom_infos_t, hdlr) },
-	{ RTA_MDHD, offsetof(trak_atom_infos_t, mdhd) },
-	{ RTA_DINF, offsetof(trak_atom_infos_t, dinf) },
 	{ RTA_STSD, offsetof(trak_atom_infos_t, stsd) },
 };
 
@@ -396,6 +387,7 @@ mp4_parser_parse_mdhd_atom(atom_info_t* atom_info, metadata_parse_context_t* con
 	const mdhd64_atom_t* atom64 = (const mdhd64_atom_t*)atom_info->ptr;
 	uint64_t duration;
 	uint32_t timescale;
+	uint16_t language;
 
 	if (atom_info->size < sizeof(*atom))
 	{
@@ -415,11 +407,13 @@ mp4_parser_parse_mdhd_atom(atom_info_t* atom_info, metadata_parse_context_t* con
 			
 		timescale = parse_be32(atom64->timescale);
 		duration = parse_be64(atom64->duration);
+		language = parse_be16(atom64->language);
 	}
 	else
 	{
 		timescale = parse_be32(atom->timescale);
 		duration = parse_be32(atom->duration);
+		language = parse_be16(atom->language);
 	}
 	
 	if (timescale == 0)
@@ -440,6 +434,8 @@ mp4_parser_parse_mdhd_atom(atom_info_t* atom_info, metadata_parse_context_t* con
 	context->media_info.frames_timescale = timescale;
 	context->media_info.full_duration = duration;
 	context->media_info.duration_millis = rescale_time(duration, timescale, 1000);
+	context->media_info.language = lang_parse_iso639_2_code(language);
+	lang_get_native_name(context->media_info.language, &context->media_info.label);
 
 	return VOD_OK;
 }
@@ -523,11 +519,6 @@ mp4_parser_parse_stts_atom_frame_duration_only(atom_info_t* atom_info, frames_pa
 		{
 			media_info->min_frame_duration = cur_duration;
 		}
-
-		if (cur_duration > media_info->max_frame_duration)
-		{
-			media_info->max_frame_duration = cur_duration;
-		}
 	}
 
 	if (media_info->min_frame_duration == 0)
@@ -553,6 +544,7 @@ mp4_parser_parse_stts_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 	uint64_t clip_from;
 	uint64_t start_time;
 	uint64_t end_time;
+	uint64_t clip_to;
 	uint64_t clip_from_accum_duration = 0;
 	uint64_t accum_duration;
 	uint64_t next_accum_duration;
@@ -849,6 +841,15 @@ mp4_parser_parse_stts_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 		}
 	}
 
+	if (context->parse_params.clip_to == UINT_MAX)
+	{
+		clip_to = ULLONG_MAX;
+	}
+	else
+	{
+		clip_to = ((uint64_t)context->parse_params.clip_to * timescale) / range->timescale;
+	}
+
 	// parse the frame durations until the next key frame
 	if (context->stss_entries != 0)
 	{
@@ -860,7 +861,7 @@ mp4_parser_parse_stts_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 			return VOD_OK;
 		}
 
-		key_frame_stss_index = mp4_parser_find_stss_entry(frame_index, context->stss_start_pos, context->stss_entries);
+    	key_frame_stss_index = mp4_parser_find_stss_entry(frame_index, context->stss_start_pos, context->stss_entries);
 		if (key_frame_stss_index >= context->stss_entries)
 		{
 			// no more keyframes, read till the end
@@ -875,6 +876,15 @@ mp4_parser_parse_stts_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 		while (frame_index < key_frame_index)
 		{
 			sample_count = vod_min(sample_count, key_frame_index - frame_index);
+
+			if (sample_duration != 0 &&
+				clip_to != ULLONG_MAX &&
+				clip_to < accum_duration + ((uint64_t)UINT_MAX) * sample_duration)
+			{
+				cur_count = vod_div_ceil(clip_to - accum_duration, sample_duration);
+				sample_count = vod_min(cur_count, sample_count);
+			}
+
 			if (frames_array.nelts + sample_count > context->parse_params.max_frame_count)
 			{
 				vod_log_error(VOD_LOG_ERR, context->request_context->log, 0,
@@ -899,6 +909,11 @@ mp4_parser_parse_stts_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 				cur_frame->pts_delay = 0;
 			}
 
+			if (frame_index >= key_frame_index || accum_duration >= clip_to)
+			{
+				break;
+			}
+
 			// fetch next sample duration and count
 			cur_entry++;
 			if (cur_entry >= last_entry)
@@ -916,6 +931,10 @@ mp4_parser_parse_stts_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 		if (key_frame_index != UINT_MAX)
 		{
 			range->end = accum_duration - clip_from_accum_duration;
+			if (clip_to < range->end)
+			{
+				range->end = clip_to;
+			}
 		}
 		else
 		{
@@ -930,6 +949,16 @@ mp4_parser_parse_stts_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 	context->frame_count = frames_array.nelts;
 	context->first_frame = first_frame;
 	context->last_frame = first_frame + frames_array.nelts;
+
+	if (clip_to != ULLONG_MAX &&
+		(cur_entry >= last_entry || (accum_duration - clip_from_accum_duration) > clip_to))
+	{
+		context->clip_to = context->parse_params.clip_to - context->parse_params.clip_from;
+	}
+	else
+	{
+		context->clip_to = UINT_MAX;
+	}
 	
 	return VOD_OK;
 }
@@ -990,9 +1019,9 @@ mp4_parser_parse_ctts_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 		}
 
 		sample_duration = parse_be32(cur_entry->duration);
-		if (sample_duration < 0)
+		if (sample_duration < 0 && (uint32_t)-sample_duration > dts_shift)
 		{
-			dts_shift = vod_max(dts_shift, (uint32_t)-sample_duration);
+			dts_shift = (uint32_t)-sample_duration;
 		}
 
 		sample_count = parse_be32(cur_entry->count);
@@ -1005,7 +1034,10 @@ mp4_parser_parse_ctts_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 	for (;;)
 	{
 		cur_limit = cur_frame + sample_count;
-		cur_limit = vod_min(cur_limit, last_frame);
+		if (cur_limit > last_frame)
+		{
+			cur_limit = last_frame;
+		}
 		for (; cur_frame < cur_limit; cur_frame++)
 		{
 			cur_frame->pts_delay = sample_duration;
@@ -1024,9 +1056,9 @@ mp4_parser_parse_ctts_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 		}
 
 		sample_duration = parse_be32(cur_entry->duration);
-		if (sample_duration < 0)
+		if (sample_duration < 0 && (uint32_t)-sample_duration > dts_shift)
 		{
-			dts_shift = vod_max(dts_shift, (uint32_t)-sample_duration);
+			dts_shift = (uint32_t)-sample_duration;
 		}
 
 		sample_count = parse_be32(cur_entry->count);
@@ -1041,8 +1073,6 @@ mp4_parser_parse_stco_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 {
 	input_frame_t* cur_frame = context->frames;
 	input_frame_t* last_frame = cur_frame + context->frame_count;
-	uint64_t* cur_offset;
-	uint64_t* last_offset;
 	uint32_t entries;
 	const u_char* cur_pos;
 	uint32_t entry_size;
@@ -1061,16 +1091,6 @@ mp4_parser_parse_stco_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 		return VOD_OK;
 	}
 
-	context->frame_offsets = vod_alloc(context->request_context->pool, context->frame_count * sizeof(uint64_t));
-	if (context->frame_offsets == NULL)
-	{
-		vod_log_debug0(VOD_LOG_DEBUG_LEVEL, context->request_context->log, 0,
-			"mp4_parser_parse_stco_atom: vod_alloc failed");
-		return VOD_ALLOC_FAILED;
-	}
-	cur_offset = context->frame_offsets;
-	last_offset = context->frame_offsets + context->frame_count;
-
 	// optimization for the case in which chunk == sample
 	if (context->chunk_equals_sample)
 	{
@@ -1084,16 +1104,16 @@ mp4_parser_parse_stco_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 		cur_pos = atom_info->ptr + sizeof(stco_atom_t) + context->first_frame * entry_size;
 		if (atom_info->name == ATOM_NAME_CO64)
 		{
-			for (; cur_offset < last_offset; cur_offset++)
+			for (; cur_frame < last_frame; cur_frame++)
 			{
-				read_be64(cur_pos, *cur_offset);
+				read_be64(cur_pos, cur_frame->offset);
 			}
 		}
 		else
 		{
-			for (; cur_offset < last_offset; cur_offset++)
+			for (; cur_frame < last_frame; cur_frame++)
 			{
-				read_be32(cur_pos, *cur_offset);
+				read_be32(cur_pos, cur_frame->offset);
 			}
 		}
 		return VOD_OK;
@@ -1112,7 +1132,7 @@ mp4_parser_parse_stco_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 	{
 		read_be64(cur_pos, cur_file_offset);
 		cur_file_offset += context->first_frame_chunk_offset;
-		for (; cur_offset < last_offset; cur_offset++, cur_frame++)
+		for (; cur_frame < last_frame; cur_frame++)
 		{
 			if (cur_frame->key_frame != cur_chunk_index)
 			{
@@ -1120,7 +1140,7 @@ mp4_parser_parse_stco_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 				cur_chunk_index = cur_frame->key_frame;
 				read_be64(cur_pos, cur_file_offset);
 			}
-			*cur_offset = cur_file_offset;
+			cur_frame->offset = cur_file_offset;
 			cur_file_offset += cur_frame->size;
 		}
 	}
@@ -1128,7 +1148,7 @@ mp4_parser_parse_stco_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 	{
 		read_be32(cur_pos, cur_file_offset);
 		cur_file_offset += context->first_frame_chunk_offset;
-		for (; cur_offset < last_offset; cur_offset++, cur_frame++)
+		for (; cur_frame < last_frame; cur_frame++)
 		{
 			if (cur_frame->key_frame != cur_chunk_index)
 			{
@@ -1136,7 +1156,7 @@ mp4_parser_parse_stco_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 				cur_chunk_index = cur_frame->key_frame;
 				read_be32(cur_pos, cur_file_offset);
 			}
-			*cur_offset = cur_file_offset;
+			cur_frame->offset = cur_file_offset;
 			cur_file_offset += cur_frame->size;
 		}
 	}
@@ -1156,14 +1176,15 @@ mp4_parser_parse_stsc_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 	input_frame_t* last_frame = cur_frame + context->frame_count;
 	const stsc_entry_t* last_entry;
 	const stsc_entry_t* cur_entry;
+	uint64_t cur_entry_samples;
 	uint32_t entries;
 	uint32_t frame_index = 0;
+	uint32_t cur_chunk_zero_based;
 	uint32_t cur_chunk;
 	uint32_t next_chunk;
 	uint32_t samples_per_chunk;
-	uint32_t cur_entry_samples;
 	uint32_t cur_sample;
-	uint32_t samples_to_skip;
+	uint32_t skip_chunks;
 	vod_status_t rc;
 
 	rc = mp4_parser_validate_stsc_atom(context->request_context, atom_info, &entries);
@@ -1185,13 +1206,12 @@ mp4_parser_parse_stsc_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 	last_entry = cur_entry + entries;
 
 	next_chunk = parse_be32(cur_entry->first_chunk);
-	if (next_chunk < 1)
+	if (next_chunk != 1)
 	{
 		vod_log_error(VOD_LOG_ERR, context->request_context->log, 0,
-			"mp4_parser_parse_stsc_atom: chunk index is zero (1)");
+			"mp4_parser_parse_stsc_atom: first chunk index is not 1");
 		return VOD_BAD_DATA;
 	}
-	next_chunk--;		// convert to 0-based
 
 	if (frame_index < context->first_frame)
 	{
@@ -1200,15 +1220,6 @@ mp4_parser_parse_stsc_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 		{
 			cur_chunk = next_chunk;
 			next_chunk = parse_be32(cur_entry[1].first_chunk);
-			samples_per_chunk = parse_be32(cur_entry->samples_per_chunk);
-			if (samples_per_chunk == 0 || next_chunk < 1)
-			{
-				vod_log_error(VOD_LOG_ERR, context->request_context->log, 0,
-					"mp4_parser_parse_stsc_atom: invalid samples per chunk %uD or chunk index %uD", samples_per_chunk, next_chunk);
-				return VOD_BAD_DATA;
-			}
-			next_chunk--;			// convert to 0-based
-
 			if (next_chunk <= cur_chunk)
 			{
 				vod_log_error(VOD_LOG_ERR, context->request_context->log, 0,
@@ -1216,22 +1227,23 @@ mp4_parser_parse_stsc_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 				return VOD_BAD_DATA;
 			}
 
-			if (next_chunk - cur_chunk > UINT_MAX / samples_per_chunk)		// integer overflow protection
+			samples_per_chunk = parse_be32(cur_entry->samples_per_chunk);
+			if (samples_per_chunk == 0)
 			{
 				vod_log_error(VOD_LOG_ERR, context->request_context->log, 0,
-					"mp4_parser_parse_stsc_atom: chunk index %uD is too big for previous index %uD and samples per chunk %uD", next_chunk, cur_chunk, samples_per_chunk);
+					"mp4_parser_parse_stsc_atom: invalid samples per chunk %uD", samples_per_chunk);
 				return VOD_BAD_DATA;
 			}
 
-			cur_entry_samples = (next_chunk - cur_chunk) * samples_per_chunk;
+			cur_entry_samples = (uint64_t)(next_chunk - cur_chunk) * samples_per_chunk;
 			if (cur_entry_samples > UINT_MAX - frame_index)		// integer overflow protection
 			{
 				vod_log_error(VOD_LOG_ERR, context->request_context->log, 0,
-					"mp4_parser_parse_stsc_atom: number of samples per entry %uD is too big", cur_entry_samples);
+					"mp4_parser_parse_stsc_atom: number of samples per entry %uL is too big", cur_entry_samples);
 				return VOD_BAD_DATA;
 			}
 
-			if (frame_index + cur_entry_samples >= context->first_frame)
+			if (frame_index + cur_entry_samples > context->first_frame)
 			{
 				next_chunk = cur_chunk;		// the first frame is within the current entry, revert the value of next chunk
 				break;
@@ -1239,8 +1251,78 @@ mp4_parser_parse_stsc_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 		}
 	}
 
-	for (; cur_entry < last_entry; cur_entry++)
+	// get and validate samples_per_chunk, cur_chunk and next_chunk
+	samples_per_chunk = parse_be32(cur_entry->samples_per_chunk);
+	if (samples_per_chunk == 0)
 	{
+		vod_log_error(VOD_LOG_ERR, context->request_context->log, 0,
+			"mp4_parser_parse_stsc_atom: samples per chunk is zero");
+		return VOD_BAD_DATA;
+	}
+	cur_chunk = next_chunk;
+	if (cur_entry + 1 < last_entry)
+	{
+		next_chunk = parse_be32(cur_entry[1].first_chunk);
+		if (next_chunk <= cur_chunk)
+		{
+			vod_log_error(VOD_LOG_ERR, context->request_context->log, 0,
+				"mp4_parser_parse_stsc_atom: chunk index %uD is smaller than the previous index %uD (2)", next_chunk, cur_chunk);
+			return VOD_BAD_DATA;
+		}
+	}
+	else
+	{
+		next_chunk = UINT_MAX;
+	}
+
+	// skip samples until we get to the first frame
+	skip_chunks = (context->first_frame - frame_index) / samples_per_chunk;
+	if (skip_chunks >= next_chunk - cur_chunk)
+	{
+		vod_log_error(VOD_LOG_ERR, context->request_context->log, 0,
+			"mp4_parser_parse_stsc_atom: failed to find first frame chunk");
+		return VOD_UNEXPECTED;
+	}
+	cur_chunk += skip_chunks;
+
+	frame_index += skip_chunks * samples_per_chunk;
+
+	context->first_chunk_frame_index = frame_index;
+	cur_sample = samples_per_chunk - (context->first_frame - frame_index);
+
+	for (;;)
+	{
+		// map the frames to the chunk they reside in
+		cur_chunk_zero_based = cur_chunk - 1;
+
+		for (; cur_sample; cur_sample--)
+		{
+			if (cur_frame >= last_frame)
+			{
+				return VOD_OK;
+			}
+
+			// Note: using the key_frame field to hold the chunk index in order to avoid allocating
+			//		extra room for it (it's temporary)
+			cur_frame->key_frame = cur_chunk_zero_based;
+			cur_frame++;
+		}
+
+		// move to the next chunk
+		cur_chunk++;
+		if (cur_chunk < next_chunk)
+		{
+			cur_sample = samples_per_chunk;
+			continue;
+		}
+
+		// move to the next entry
+		cur_entry++;
+		if (cur_entry >= last_entry)
+		{
+			break;
+		}
+
 		// get and validate samples_per_chunk, cur_chunk and next_chunk
 		samples_per_chunk = parse_be32(cur_entry->samples_per_chunk);
 		if (samples_per_chunk == 0)
@@ -1253,13 +1335,6 @@ mp4_parser_parse_stsc_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 		if (cur_entry + 1 < last_entry)
 		{
 			next_chunk = parse_be32(cur_entry[1].first_chunk);
-			if (next_chunk < 1)
-			{
-				vod_log_error(VOD_LOG_ERR, context->request_context->log, 0,
-					"mp4_parser_parse_stsc_atom: chunk index is zero (2)");
-				return VOD_BAD_DATA;
-			}
-			next_chunk--;			// convert to 0-based
 			if (next_chunk <= cur_chunk)
 			{
 				vod_log_error(VOD_LOG_ERR, context->request_context->log, 0,
@@ -1272,36 +1347,7 @@ mp4_parser_parse_stsc_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 			next_chunk = UINT_MAX;
 		}
 
-		// map the frames to the chunk they reside in
-		for (; cur_chunk < next_chunk; cur_chunk++)
-		{
-			cur_sample = samples_per_chunk;
-			if (frame_index < context->first_frame)
-			{
-				// skip samples until we get to the first frame
-				samples_to_skip = vod_min(context->first_frame - frame_index, samples_per_chunk);
-				cur_sample -= samples_to_skip;
-				frame_index += samples_to_skip;
-			}
-
-			for (; cur_sample; cur_sample--, frame_index++)
-			{
-				if (frame_index == context->first_frame)
-				{
-					context->first_chunk_frame_index = frame_index - (samples_per_chunk - cur_sample);
-				}
-
-				if (cur_frame >= last_frame)
-				{
-					return VOD_OK;
-				}
-
-				// Note: using the key_frame field to hold the chunk index in order to avoid allocating
-				//		extra room for it (it's temporary)
-				cur_frame->key_frame = cur_chunk;
-				cur_frame++;
-			}
-		}
+		cur_sample = samples_per_chunk;
 	}
 
 	// unexpected - didn't reach the last frame
@@ -1387,6 +1433,7 @@ mp4_parser_parse_stsz_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 	uint32_t first_frame_index_in_chunk = context->first_frame - context->first_chunk_frame_index;
 	const u_char* cur_pos;
 	uint32_t uniform_size;
+	uint32_t cur_size;
 	uint32_t entries;
 	unsigned field_size;
 	vod_status_t rc;
@@ -1418,14 +1465,15 @@ mp4_parser_parse_stsz_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 		}
 		for (; cur_frame < last_frame; cur_frame++)
 		{
-			read_be32(cur_pos, cur_frame->size);
-			if (cur_frame->size > MAX_FRAME_SIZE)
+			read_be32(cur_pos, cur_size);
+			if (cur_size > MAX_FRAME_SIZE)
 			{
 				vod_log_error(VOD_LOG_ERR, context->request_context->log, 0,
-					"mp4_parser_parse_stsz_atom: frame size %uD too big", cur_frame->size);
+					"mp4_parser_parse_stsz_atom: frame size %uD too big", cur_size);
 				return VOD_BAD_DATA;
 			}
-			context->total_frames_size += cur_frame->size;
+			context->total_frames_size += cur_size;
+			cur_frame->size = cur_size;
 		}
 		break;
 
@@ -1437,9 +1485,10 @@ mp4_parser_parse_stsz_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 		}
 		for (; cur_frame < last_frame; cur_frame++)
 		{
-			read_be16(cur_pos, cur_frame->size);
+			read_be16(cur_pos, cur_size);
 			// Note: no need to validate the size here, since MAX_UINT16 < MAX_FRAME_SIZE
-			context->total_frames_size += cur_frame->size;
+			context->total_frames_size += cur_size;
+			cur_frame->size = cur_size;
 		}
 		break;
 		
@@ -1451,9 +1500,10 @@ mp4_parser_parse_stsz_atom(atom_info_t* atom_info, frames_parse_context_t* conte
 		}
 		for (; cur_frame < last_frame; cur_frame++)
 		{
-			cur_frame->size = *cur_pos++;
+			cur_size = *cur_pos++;
 			// Note: no need to validate the size here, since MAX_UINT8 < MAX_FRAME_SIZE
-			context->total_frames_size += cur_frame->size;
+			context->total_frames_size += cur_size;
+			cur_frame->size = cur_size;
 		}
 		break;
 		
@@ -1585,8 +1635,8 @@ mp4_parser_parse_video_extra_data_atom(void* ctx, atom_info_t* atom_info)
 		return VOD_OK;
 	}
 	
-	context->media_info.extra_data_size = atom_info->size;
-	context->media_info.extra_data = atom_info->ptr;
+	context->media_info.extra_data.len = atom_info->size;
+	context->media_info.extra_data.data = (u_char*)atom_info->ptr;
 	
 	return VOD_OK;
 }
@@ -1660,14 +1710,13 @@ mp4_parser_read_config_descriptor(metadata_parse_context_t* context, simple_read
 				"mp4_parser_read_config_descriptor: tag length %ud too big", len);
 			return VOD_BAD_DATA;
 		}
-		context->media_info.extra_data_size = len;
-		context->media_info.extra_data = stream->cur_pos;
+		context->media_info.extra_data.len = len;
+		context->media_info.extra_data.data = (u_char*)stream->cur_pos;
 
 		codec_config = &context->media_info.u.audio.codec_config;
 		rc = codec_config_mp4a_config_parse(
 			context->request_context, 
-			context->media_info.extra_data, 
-			context->media_info.extra_data_size, 
+			&context->media_info.extra_data, 
 			codec_config);
 		if (rc != VOD_OK)
 		{
@@ -1844,6 +1893,7 @@ mp4_parser_parse_stsd_atom(atom_info_t* atom_info, metadata_parse_context_t* con
 {
 	const stsd_atom_t* atom = (const stsd_atom_t*)atom_info->ptr;
 	uint32_t entries;
+	const u_char* entry_end_pos;
 	const u_char* cur_pos;
 	const u_char* end_pos;
 	uint32_t size;
@@ -1887,37 +1937,48 @@ mp4_parser_parse_stsd_atom(atom_info_t* atom_info, metadata_parse_context_t* con
 	
 		context->media_info.format = parse_le32(((stsd_entry_header_t*)cur_pos)->format);
 		size = parse_be32(((stsd_entry_header_t*)cur_pos)->size);
+		if (size > end_pos - cur_pos)
+		{
+			vod_log_error(VOD_LOG_ERR, context->request_context->log, 0,
+				"mp4_parser_parse_stsd_atom: stsd entry overflow the stream");
+			return VOD_BAD_DATA;
+		}
+
+		entry_end_pos = cur_pos + size;
+
 		cur_pos += sizeof(stsd_entry_header_t);
 		if (size >= 16)
 		{
 			cur_pos += sizeof(stsd_large_entry_header_t);
 		}
 		
-		cur_pos = skip_function(cur_pos, end_pos, context);
+		cur_pos = skip_function(cur_pos, entry_end_pos, context);
 		if (cur_pos == NULL)
 		{
 			vod_log_error(VOD_LOG_ERR, context->request_context->log, 0,
 				"mp4_parser_parse_stsd_atom: failed to skip audio/video data");
 			return VOD_BAD_DATA;
 		}
-	}
 
-	if (cur_pos > end_pos)
-	{
-		vod_log_error(VOD_LOG_ERR, context->request_context->log, 0,
-			"mp4_parser_parse_stsd_atom: stream overflow before reaching extra data");
-		return VOD_BAD_DATA;
-	}
-	
-	if (cur_pos < end_pos)
-	{
-		vod_log_buffer(VOD_LOG_DEBUG_LEVEL, context->request_context->log, 0, "mp4_parser_parse_stsd_atom: extra data ", cur_pos, end_pos - cur_pos);
-		
-		rc = mp4_parser_parse_atoms(context->request_context, cur_pos, end_pos - cur_pos, TRUE, parse_function, context);
-		if (rc != VOD_OK)
+		if (cur_pos > entry_end_pos)
 		{
-			return rc;
+			vod_log_error(VOD_LOG_ERR, context->request_context->log, 0,
+				"mp4_parser_parse_stsd_atom: stream overflow before reaching extra data");
+			return VOD_BAD_DATA;
 		}
+
+		if (cur_pos + 8 < entry_end_pos)
+		{
+			vod_log_buffer(VOD_LOG_DEBUG_LEVEL, context->request_context->log, 0, "mp4_parser_parse_stsd_atom: extra data ", cur_pos, entry_end_pos - cur_pos);
+
+			rc = mp4_parser_parse_atoms(context->request_context, cur_pos, entry_end_pos - cur_pos, TRUE, parse_function, context);
+			if (rc != VOD_OK)
+			{
+				return rc;
+			}
+		}
+
+		cur_pos = entry_end_pos;
 	}
 	
 	return VOD_OK;
@@ -2061,7 +2122,6 @@ mp4_parser_parse_mvhd_atom(process_moov_context_t* context, atom_info_t* atom_in
 	const mvhd_atom_t* atom = (const mvhd_atom_t*)atom_info->ptr;
 	const mvhd64_atom_t* atom64;
 	mp4_base_metadata_t* result = context->result;
-	u_char* atom_data;
 
 	if (atom_info->size < sizeof(*atom))
 	{
@@ -2087,22 +2147,6 @@ mp4_parser_parse_mvhd_atom(process_moov_context_t* context, atom_info_t* atom_in
 		result->mvhd_timescale = parse_be32(atom->timescale);
 	}
 
-	if ((context->parse_params.parse_type & PARSE_FLAG_SAVE_RAW_ATOMS) != 0)
-	{
-		result->mvhd_atom.size = atom_info->header_size + atom_info->size;
-		result->mvhd_atom.header_size = atom_info->header_size;
-		atom_data = vod_alloc(context->request_context->pool, result->mvhd_atom.size);
-		if (atom_data == NULL)
-		{
-			vod_log_debug0(VOD_LOG_DEBUG_LEVEL, context->request_context->log, 0,
-				"mp4_parser_parse_mvhd_atom: vod_alloc failed");
-			return VOD_ALLOC_FAILED;
-		}
-
-		vod_memcpy(atom_data, atom_info->ptr - atom_info->header_size, result->mvhd_atom.size);
-		result->mvhd_atom.ptr = atom_data;
-	}
-
 	return VOD_OK;
 }
 
@@ -2111,18 +2155,17 @@ mp4_parser_process_moov_atom_callback(void* ctx, atom_info_t* atom_info)
 {
 	process_moov_context_t* context = (process_moov_context_t*)ctx;
 	save_relevant_atoms_context_t save_atoms_context;
-	codec_config_get_nal_units_t get_nal_units = NULL;
 	metadata_parse_context_t metadata_parse_context;
 	mp4_track_base_metadata_t* result_track;
 	mp4_base_metadata_t* result = context->result;
 	trak_atom_infos_t trak_atom_infos;
+	media_sequence_t* sequence;
 	uint32_t duration_millis;
 	uint32_t track_index;
+	bool_t extra_data_required;
 	bool_t format_supported;
 	vod_status_t rc;
-	u_char* new_extra_data;
 	int parse_type;
-	uint8_t channel_config;
 
 	switch (atom_info->name)
 	{
@@ -2165,6 +2208,7 @@ mp4_parser_process_moov_atom_callback(void* ctx, atom_info_t* atom_info)
 	}
 
 	// make sure the codec is supported
+	extra_data_required = TRUE;
 	format_supported = FALSE;
 	switch (metadata_parse_context.media_info.media_type)
 	{
@@ -2174,13 +2218,13 @@ mp4_parser_process_moov_atom_callback(void* ctx, atom_info_t* atom_info)
 		case FORMAT_AVC1:
 		case FORMAT_h264:
 		case FORMAT_H264:
-			get_nal_units = codec_config_avcc_get_nal_units;
+			metadata_parse_context.media_info.codec_id = VOD_CODEC_ID_AVC;
 			format_supported = TRUE;
 			break;
 
 		case FORMAT_HEV1:
 		case FORMAT_HVC1:
-			get_nal_units = codec_config_hevc_get_nal_units;
+			metadata_parse_context.media_info.codec_id = VOD_CODEC_ID_HEVC;
 			format_supported = TRUE;
 			break;
 		}
@@ -2195,7 +2239,15 @@ mp4_parser_process_moov_atom_callback(void* ctx, atom_info_t* atom_info)
 			case 0x66:
 			case 0x67:
 			case 0x68:
+				metadata_parse_context.media_info.codec_id = VOD_CODEC_ID_AAC;
 				format_supported = TRUE;
+				break;
+
+			case 0x69:
+			case 0x6B:
+				metadata_parse_context.media_info.codec_id = VOD_CODEC_ID_MP3;
+				format_supported = TRUE;
+				extra_data_required = FALSE;
 				break;
 			}
 		}
@@ -2210,8 +2262,16 @@ mp4_parser_process_moov_atom_callback(void* ctx, atom_info_t* atom_info)
 		return VOD_OK;
 	}
 
+	if (!vod_codec_in_mask(metadata_parse_context.media_info.codec_id, metadata_parse_context.parse_params.codecs_mask))
+	{
+		vod_log_debug2(VOD_LOG_DEBUG_LEVEL, context->request_context->log, 0,
+			"mp4_parser_process_moov_atom_callback: codec %uD not supported for this request mask 0x%xd",
+			metadata_parse_context.media_info.codec_id, metadata_parse_context.parse_params.codecs_mask);
+		return VOD_OK;
+	}
+
 	// make sure we got the extra data
-	if (metadata_parse_context.media_info.extra_data == NULL)
+	if (extra_data_required && metadata_parse_context.media_info.extra_data.data == NULL)
 	{
 		vod_log_error(VOD_LOG_ERR, context->request_context->log, 0,
 			"mp4_parser_process_moov_atom_callback: no extra data was parsed for track");
@@ -2225,9 +2285,38 @@ mp4_parser_process_moov_atom_callback(void* ctx, atom_info_t* atom_info)
 		return rc;
 	}
 
+	// get the duration and language
+	rc = mp4_parser_parse_mdhd_atom(&trak_atom_infos.mdhd, &metadata_parse_context);
+	if (rc != VOD_OK)
+	{
+		return rc;
+	}
+
+	// inherit the sequence language and label
+	sequence = context->file_info->source->sequence;
+	if (sequence->label.len != 0)
+	{
+		metadata_parse_context.media_info.label = sequence->label;
+
+		// Note: it is not possible for the sequence to have a language without a label,
+		//              since a default label will be assigned according to the language
+		if (sequence->language != 0)
+		{
+			metadata_parse_context.media_info.language = sequence->language;
+		}
+	}
+
 	// check whether we should include this track
 	track_index = context->track_indexes[metadata_parse_context.media_info.media_type]++;
 	if ((context->parse_params.required_tracks_mask[metadata_parse_context.media_info.media_type] & (1 << track_index)) == 0)
+	{
+		return VOD_OK;
+	}
+
+	// filter by language
+	if (context->parse_params.langs_mask != NULL &&
+		metadata_parse_context.media_info.media_type == MEDIA_TYPE_AUDIO &&
+		!vod_is_bit_set(context->parse_params.langs_mask, metadata_parse_context.media_info.language))
 	{
 		return VOD_OK;
 	}
@@ -2244,16 +2333,9 @@ mp4_parser_process_moov_atom_callback(void* ctx, atom_info_t* atom_info)
 		}
 	}
 
-	// get the duration
-	rc = mp4_parser_parse_mdhd_atom(&trak_atom_infos.mdhd, &metadata_parse_context);
-	if (rc != VOD_OK)
-	{
-		return rc;
-	}
-
 	// Microsoft H.264 Encoder generates a wrong duration in mdhd, pull it from stts
-	if (context->ftyp_size >= sizeof(uint32_t) && 
-		parse_le32(context->ftyp_buffer) == FTYP_TYPE_MP42)
+	if (context->ftyp_atom.len >= sizeof(uint32_t) && 
+		parse_le32(context->ftyp_atom.data) == FTYP_TYPE_MP42)
 	{
 		rc = mp4_parser_parse_stts_atom_total_duration_only(&trak_atom_infos.stts, &metadata_parse_context);
 		if (rc != VOD_OK)
@@ -2279,107 +2361,24 @@ mp4_parser_process_moov_atom_callback(void* ctx, atom_info_t* atom_info)
 		metadata_parse_context.media_info.duration = metadata_parse_context.media_info.full_duration;
 	}
 
-	if (metadata_parse_context.media_info.media_type == MEDIA_TYPE_AUDIO)
+	rc = media_format_finalize_track(
+		context->request_context,
+		parse_type,
+		&metadata_parse_context.media_info);
+	if (rc != VOD_OK)
 	{
-		// always save the audio extra data to support audio filtering
-		parse_type |= PARSE_FLAG_EXTRA_DATA;
-
-		// derive the channel count from the codec config when possible
-		//	the channel count in the stsd atom is occasionally wrong
-		channel_config = metadata_parse_context.media_info.u.audio.codec_config.channel_config;
-		if (channel_config > 0 && channel_config < vod_array_entries(channel_config_to_channel_count))
-		{
-			metadata_parse_context.media_info.u.audio.channels = channel_config_to_channel_count[channel_config];
-		}
-	}
-
-	// get the codec name
-	if ((parse_type & PARSE_FLAG_CODEC_NAME) != 0)
-	{
-		metadata_parse_context.media_info.codec_name.data = vod_alloc(context->request_context->pool, MAX_CODEC_NAME_SIZE);
-		if (metadata_parse_context.media_info.codec_name.data == NULL)
-		{
-			vod_log_error(VOD_LOG_ERR, context->request_context->log, 0,
-				"mp4_parser_process_moov_atom_callback: failed to allocate codec name");
-			return VOD_ALLOC_FAILED;
-		}
-
-		switch (metadata_parse_context.media_info.media_type)
-		{
-		case MEDIA_TYPE_VIDEO:
-			rc = codec_config_get_video_codec_name(context->request_context, &metadata_parse_context.media_info);
-			break;
-
-		case MEDIA_TYPE_AUDIO:
-			rc = codec_config_get_audio_codec_name(context->request_context, &metadata_parse_context.media_info);
-			break;
-		}
-
-		if (rc != VOD_OK)
-		{
-			vod_log_debug0(VOD_LOG_DEBUG_LEVEL, context->request_context->log, 0,
-				"mp4_parser_process_moov_atom_callback: failed to get codec name");
-			return rc;
-		}
-	}
-
-	// parse / copy the extra data
-	if ((parse_type & (PARSE_FLAG_EXTRA_DATA | PARSE_FLAG_EXTRA_DATA_SIZE)) != 0)
-	{
-		if ((parse_type & PARSE_FLAG_EXTRA_DATA_PARSE) != 0 && 
-			metadata_parse_context.media_info.media_type == MEDIA_TYPE_VIDEO)
-		{
-			// extract the nal units
-			rc = get_nal_units(
-				context->request_context,
-				metadata_parse_context.media_info.extra_data,
-				metadata_parse_context.media_info.extra_data_size,
-				(parse_type & PARSE_FLAG_EXTRA_DATA) == 0,
-				&metadata_parse_context.media_info.u.video.nal_packet_size_length,
-				&new_extra_data,
-				&metadata_parse_context.media_info.extra_data_size);
-			if (rc != VOD_OK)
-			{
-				vod_log_debug1(VOD_LOG_DEBUG_LEVEL, context->request_context->log, 0,
-					"mp4_parser_process_moov_atom_callback: get_nal_units failed %i", rc);
-				return rc;
-			}
-
-			metadata_parse_context.media_info.extra_data = new_extra_data;
-		}
-		else if ((parse_type & PARSE_FLAG_EXTRA_DATA) != 0)
-		{
-			// copy the extra data, we should not reference the moov buffer after we finish parsing
-			new_extra_data = vod_alloc(context->request_context->pool, metadata_parse_context.media_info.extra_data_size);
-			if (new_extra_data == NULL)
-			{
-				vod_log_debug0(VOD_LOG_DEBUG_LEVEL, context->request_context->log, 0,
-					"mp4_parser_process_moov_atom_callback: vod_alloc failed");
-				return VOD_ALLOC_FAILED;
-			}
-			vod_memcpy(new_extra_data, metadata_parse_context.media_info.extra_data, metadata_parse_context.media_info.extra_data_size);
-			metadata_parse_context.media_info.extra_data = new_extra_data;
-		}
-		else
-		{
-			metadata_parse_context.media_info.extra_data = NULL;
-		}
-	}
-	else
-	{
-		metadata_parse_context.media_info.extra_data = NULL;
-		metadata_parse_context.media_info.extra_data_size = 0;
+		return rc;
 	}
 
 	// add to the result array
-	if (result->tracks.nelts >= MAX_TRACK_COUNT)
+	if (result->base.tracks.nelts >= MAX_TRACK_COUNT)
 	{
-		vod_log_debug0(VOD_LOG_DEBUG_LEVEL, context->request_context->log, 0,
+		vod_log_error(VOD_LOG_ERR, context->request_context->log, 0,
 			"mp4_parser_process_moov_atom_callback: track count exceeded the limit");
 		return VOD_BAD_REQUEST;
 	}
 
-	result_track = vod_array_push(&result->tracks);
+	result_track = vod_array_push(&result->base.tracks);
 	if (result_track == NULL)
 	{
 		vod_log_debug0(VOD_LOG_DEBUG_LEVEL, context->request_context->log, 0,
@@ -2394,11 +2393,11 @@ mp4_parser_process_moov_atom_callback(void* ctx, atom_info_t* atom_info)
 	result_track->track_index = track_index;
 
 	// update max duration / track index
-	if (result->duration == 0 ||
-		result->duration * metadata_parse_context.media_info.timescale < metadata_parse_context.media_info.duration * result->timescale)
+	if (result->base.duration == 0 ||
+		result->base.duration * metadata_parse_context.media_info.timescale < metadata_parse_context.media_info.duration * result->base.timescale)
 	{
-		result->duration = metadata_parse_context.media_info.duration;
-		result->timescale = metadata_parse_context.media_info.timescale;
+		result->base.duration = metadata_parse_context.media_info.duration;
+		result->base.timescale = metadata_parse_context.media_info.timescale;
 	}
 
 	return VOD_OK;
@@ -2463,18 +2462,25 @@ vod_status_t
 mp4_parser_parse_basic_metadata(
 	request_context_t* request_context,
 	media_parse_params_t* parse_params,
-	const u_char* ftyp_buffer,
-	size_t ftyp_size,
-	const u_char* moov_buffer,
-	size_t moov_size,
+	vod_str_t* metadata_parts,
+	size_t metadata_part_count,
 	file_info_t* file_info,
-	mp4_base_metadata_t* result)
+	media_base_metadata_t** result)
 {
 	process_moov_context_t context;
+	mp4_base_metadata_t* metadata;
 	vod_status_t rc;
 
-	vod_memzero(result, sizeof(*result));
-	if (vod_array_init(&result->tracks, request_context->pool, 2, sizeof(mp4_track_base_metadata_t)) != VOD_OK)
+	metadata = vod_alloc(request_context->pool, sizeof(*metadata));
+	if (metadata == NULL)
+	{
+		vod_log_debug0(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
+			"mp4_parser_parse_basic_metadata: vod_alloc failed");
+		return VOD_ALLOC_FAILED;
+	}
+
+	vod_memzero(metadata, sizeof(*metadata));
+	if (vod_array_init(&metadata->base.tracks, request_context->pool, 2, sizeof(mp4_track_base_metadata_t)) != VOD_OK)
 	{
 		vod_log_debug0(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
 			"mp4_parser_parse_basic_metadata: vod_array_init failed");
@@ -2485,14 +2491,13 @@ mp4_parser_parse_basic_metadata(
 	context.parse_params = *parse_params;
 	vod_memzero(context.track_indexes, sizeof(context.track_indexes));
 	context.file_info = file_info;
-	context.ftyp_buffer = ftyp_buffer;
-	context.ftyp_size = ftyp_size;
-	context.result = result;
+	context.ftyp_atom = metadata_parts[MP4_METADATA_PART_FTYP];
+	context.result = metadata;
 
 	rc = mp4_parser_parse_atoms(
 		request_context, 
-		moov_buffer, 
-		moov_size, 
+		metadata_parts[MP4_METADATA_PART_MOOV].data,
+		metadata_parts[MP4_METADATA_PART_MOOV].len,
 		TRUE, 
 		&mp4_parser_process_moov_atom_callback, 
 		&context);
@@ -2501,12 +2506,14 @@ mp4_parser_parse_basic_metadata(
 		return rc;
 	}
 
-	if (result->mvhd_timescale == 0)
+	if (metadata->mvhd_timescale == 0)
 	{
 		vod_log_error(VOD_LOG_ERR, request_context->log, 0,
 			"mp4_parser_parse_basic_metadata: mvhd timescale was not set");
 		return VOD_BAD_DATA;
 	}
+
+	*result = &metadata->base;
 
 	return VOD_OK;
 }
@@ -2599,14 +2606,17 @@ mp4_parser_compare_tracks(const void *s1, const void *s2)
 vod_status_t
 mp4_parser_parse_frames(
 	request_context_t* request_context,
-	mp4_base_metadata_t* base,
+	media_base_metadata_t* base_metadata,
 	media_parse_params_t* parse_params,
-	bool_t align_segments_to_key_frames,
+	segmenter_conf_t* segmenter,
 	read_cache_state_t* read_cache_state,
+	vod_str_t* frame_data,
+	media_format_read_request_t* read_req,
 	media_track_array_t* result)
 {
-	mp4_track_base_metadata_t* first_track = (mp4_track_base_metadata_t*)base->tracks.elts;
-	mp4_track_base_metadata_t* last_track = first_track + base->tracks.nelts;
+	mp4_base_metadata_t* metadata = vod_container_of(base_metadata, mp4_base_metadata_t, base);
+	mp4_track_base_metadata_t* first_track = (mp4_track_base_metadata_t*)metadata->base.tracks.elts;
+	mp4_track_base_metadata_t* last_track = first_track + metadata->base.tracks.nelts;
 	mp4_track_base_metadata_t* cur_track;
 	frames_parse_context_t context;
 	frames_source_t* frames_source;
@@ -2617,6 +2627,7 @@ mp4_parser_parse_frames(
 	void* frames_source_context;
 	vod_status_t rc;
 	vod_array_t tracks;
+	uint64_t last_offset;
 	uint32_t media_type;
 
 	if (vod_array_init(&tracks, request_context->pool, 2, sizeof(media_track_t)) != VOD_OK)
@@ -2627,7 +2638,6 @@ mp4_parser_parse_frames(
 	}
 
 	vod_memzero(result, sizeof(*result));
-	result->mvhd_atom = base->mvhd_atom;
 
 	// in case we need to parse the frame sizes, we already find the total size
 	if ((parse_params->parse_type & PARSE_FLAG_FRAMES_SIZE) != 0)
@@ -2635,20 +2645,26 @@ mp4_parser_parse_frames(
 		parse_params->parse_type &= ~PARSE_FLAG_TOTAL_SIZE_ESTIMATE;
 	}
 
-	if (align_segments_to_key_frames)
+	if (segmenter->align_to_key_frames)
 	{
 		// sort the streams - video first
-		qsort(first_track, base->tracks.nelts, sizeof(*first_track), mp4_parser_compare_tracks);
+		qsort(first_track, metadata->base.tracks.nelts, sizeof(*first_track), mp4_parser_compare_tracks);
 	}
 
 	// initialize the context
 	context.request_context = request_context;
 	context.parse_params = *parse_params;
 	context.clip_from = rescale_time(parse_params->clip_from, 1000, parse_params->range->timescale);
-	context.mvhd_timescale = base->mvhd_timescale;
+	context.mvhd_timescale = metadata->mvhd_timescale;
 
 	for (cur_track = first_track; cur_track < last_track; cur_track++)
 	{
+		vod_log_debug3(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
+			"mp4_parser_parse_frames: parsing range %uL-%uL scale %uD",
+			context.parse_params.range->start,
+			context.parse_params.range->end,
+			context.parse_params.range->timescale);
+
 		media_type = cur_track->media_info.media_type;
 
 		// update the media info on the context
@@ -2660,7 +2676,7 @@ mp4_parser_parse_frames(
 		if (cur_track == first_track &&
 			media_type == MEDIA_TYPE_VIDEO &&
 			cur_track->trak_atom_infos.stss.size != 0 &&
-			align_segments_to_key_frames)
+			segmenter->align_to_key_frames)
 		{
 			rc = mp4_parser_validate_stss_atom(context.request_context, &cur_track->trak_atom_infos.stss, &context.stss_entries);
 			if (rc != VOD_OK)
@@ -2706,6 +2722,7 @@ mp4_parser_parse_frames(
 			request_context,
 			read_cache_state,
 			cur_track->file_info.source,
+			media_type,
 			&frames_source_context);
 		if (rc != VOD_OK)
 		{
@@ -2736,17 +2753,18 @@ mp4_parser_parse_frames(
 			frames_source = &mp4_decrypt_frames_source;
 		}
 
-		result_track->frames_source = frames_source;
-		result_track->frames_source_context = frames_source_context;
+		result_track->frames.next = NULL;
+		result_track->frames.frames_source = frames_source;
+		result_track->frames.frames_source_context = frames_source_context;
+		result_track->frames.first_frame = context.frames;
+		result_track->frames.last_frame = context.frames + context.frame_count;
+		result_track->frames.clip_to = context.clip_to;
 
 		// copy the result
 		result_track->media_info = cur_track->media_info;
 		result_track->encryption_info = context.encryption_info;
 		result_track->file_info = cur_track->file_info;
 		result_track->index = cur_track->track_index;
-		result_track->first_frame = context.frames;
-		result_track->last_frame = context.frames + context.frame_count;
-		result_track->frame_offsets = context.frame_offsets;
 		result_track->frame_count = context.frame_count;
 		result_track->key_frame_count = context.key_frame_count;
 		result_track->total_frames_size = context.total_frames_size;
@@ -2756,6 +2774,22 @@ mp4_parser_parse_frames(
 		result_track->clip_start_time = parse_params->clip_start_time;
 		result_track->clip_from_frame_offset = context.clip_from_frame_offset;
 		result_track->source_clip = NULL;
+
+		// update the last offset of the source clip
+		if (context.frame_count > 0)
+		{
+			last_frame = result_track->frames.last_frame - 1;
+			last_offset = last_frame->offset + last_frame->size;
+			if (last_offset > cur_track->file_info.source->last_offset)
+			{
+				cur_track->file_info.source->last_offset = last_offset;
+			}
+		}
+
+		vod_log_debug1(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
+			"mp4_parser_parse_frames: first frame dts is %uL",
+			rescale_time(result_track->first_frame_time_offset, result_track->media_info.timescale, 1000) + 
+			result_track->clip_start_time);
 
 		// copy raw atoms
 		if ((parse_params->parse_type & PARSE_FLAG_SAVE_RAW_ATOMS) != 0)

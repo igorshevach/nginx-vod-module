@@ -3,8 +3,9 @@
 
 // includes
 #include "../mp4/mp4_builder.h"
-#include "../mp4/mp4_parser.h"
+#include "../media_format.h"
 #include "../common.h"
+#include "hds_encryption.h"
 
 // constants
 #define HDS_TIMESCALE (1000)
@@ -24,8 +25,9 @@ typedef struct {
 vod_status_t hds_muxer_init_fragment(
 	request_context_t* request_context,
 	hds_fragment_config_t* conf,
+	hds_encryption_params_t* encryption_params,
 	uint32_t segment_index,
-	media_sequence_t* sequence,
+	media_set_t* media_set,
 	write_callback_t write_callback,
 	void* write_context,
 	bool_t size_only,

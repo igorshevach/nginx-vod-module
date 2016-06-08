@@ -2,37 +2,10 @@
 #define __MP4_BUILDER_H__
 
 // includes
+#include "../write_stream.h"
 #include "../media_set.h"
 
 // macros
-#define write_le32(p, dw)			\
-	{								\
-	*(p)++ = (dw) & 0xFF;			\
-	*(p)++ = ((dw) >> 8) & 0xFF;	\
-	*(p)++ = ((dw) >> 16) & 0xFF;	\
-	*(p)++ = ((dw) >> 24) & 0xFF;	\
-	}
-
-#define write_be16(p, w)			\
-	{								\
-	*(p)++ = ((w) >> 8) & 0xFF;		\
-	*(p)++ = (w) & 0xFF;			\
-	}
-
-#define write_be32(p, dw)			\
-	{								\
-	*(p)++ = ((dw) >> 24) & 0xFF;	\
-	*(p)++ = ((dw) >> 16) & 0xFF;	\
-	*(p)++ = ((dw) >> 8) & 0xFF;	\
-	*(p)++ = (dw) & 0xFF;			\
-	}
-
-#define write_be64(p, qw)			\
-	{								\
-	write_be32(p, (qw) >> 32);		\
-	write_be32(p, (qw));			\
-	}
-
 #define write_atom_name(p, c1, c2, c3, c4) \
 	{ *(p)++ = (c1); *(p)++ = (c2); *(p)++ = (c3); *(p)++ = (c4); }
 
@@ -71,11 +44,9 @@ typedef struct {
 
 	media_sequence_t* sequence;
 	media_clip_filtered_t* cur_clip;
-	frames_source_t* frames_source;
-	void* frames_source_context;
+	frame_list_part_t* first_frame_part;
+	frame_list_part_t cur_frame_part;
 	input_frame_t* cur_frame;
-	input_frame_t* last_frame;
-	uint64_t* cur_frame_offset;
 	bool_t first_time;
 	bool_t frame_started;
 } fragment_writer_state_t;

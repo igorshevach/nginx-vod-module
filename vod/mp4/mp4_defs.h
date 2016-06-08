@@ -10,6 +10,7 @@
 // these constants can be generated with python - 'moov'[::-1].encode('hex')
 #define ATOM_NAME_FTYP (0x70797466)		// file type
 #define ATOM_NAME_MOOV (0x766f6f6d)		// movie header
+#define ATOM_NAME_MDAT (0x7461646d)		// movie data
 #define ATOM_NAME_TRAK (0x6b617274)		// track header
 #define ATOM_NAME_EDTS (0x73746465)		// edit box
 #define ATOM_NAME_ELST (0x74736c65)		// edit list box
@@ -52,6 +53,18 @@
 #define DCOM_TYPE_ZLIB (0x62696c7a)
 
 #define FTYP_TYPE_MP42 (0x3234706d)
+
+// h264 4cc tags
+#define FORMAT_AVC1	   (0x31637661)
+#define FORMAT_h264	   (0x34363268)
+#define FORMAT_H264	   (0x34363248)
+
+// h265 4cc tags
+#define FORMAT_HEV1	   (0x31766568)
+#define FORMAT_HVC1	   (0x31637668)
+
+// aac 4cc tag
+#define FORMAT_MP4A    (0x6134706d)
 
 // MP4 constants from ffmpeg
 #define MP4ODescrTag				0x01
@@ -100,7 +113,14 @@ typedef struct {
 	u_char	track_id[4];
 	u_char  reserved1[4];
 	u_char  duration[4];
-	// Note: additional fields not listed
+	u_char  reserved2[2 * 4];
+	u_char  layer[2];
+	u_char  alternate_group[2];
+	u_char  volume[2];
+	u_char  reserved[2];
+	u_char  matrix[4 * 9];
+	u_char  width[4];
+	u_char  height[4];
 } tkhd_atom_t;
 
 typedef struct {
@@ -111,7 +131,14 @@ typedef struct {
 	u_char	track_id[4];
 	u_char  reserved1[4];
 	u_char  duration[8];
-	// Note: additional fields not listed
+	u_char  reserved2[2 * 4];
+	u_char  layer[2];
+	u_char  alternate_group[2];
+	u_char  volume[2];
+	u_char  reserved[2];
+	u_char  matrix[4 * 9];
+	u_char  width[4];
+	u_char  height[4];
 } tkhd64_atom_t;
 
 typedef struct {
@@ -225,6 +252,11 @@ typedef struct {
 } hdlr_atom_t;
 
 typedef struct {
+	u_char    reserved1[6];
+	u_char    data_reference_index[2];
+} sample_entry_t;
+
+typedef struct {
 	u_char	version[2];
 	u_char	revision_level[2];
 	u_char	vendor[4];
@@ -282,6 +314,11 @@ typedef struct {
 	u_char	g[2];
 	u_char	b[2];
 } stsd_video_palette_entry_t;
+
+typedef struct {
+	u_char tag[1];
+	u_char len[1];
+} descr_header_t;
 
 typedef struct {
 	u_char object_type_id[1];

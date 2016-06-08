@@ -8,7 +8,7 @@
 * Working modes:
   1. Local - serve locally accessible files (local disk/NFS mounted)
   2. Remote - serve files accessible via HTTP using range requests
-  3. Mapped - perform an HTTP request to map the input URI to a locally accessible file
+  3. Mapped - serve files according to a specification encoded in JSON format. The JSON can pulled from a remote server, or read from a local file
 
 * Adaptive bitrate support
 
@@ -23,6 +23,12 @@
 * Audio codecs: AAC
 
 * Audio only/video only files
+
+* Alternative audio renditions - supporting both:
+  1. Generation of manifest with different audio renditions, allowing selection on the client side
+  2. Muxing together audio and video streams from separate files / tracks - provides the ability
+	to serve different audio renditions of a single video, without the need for any special support
+	on the client side.
 
 * Track selection for multi audio/video MP4 files
 
@@ -40,8 +46,6 @@ without the overhead of short segments for the whole duration of the video
 * DASH: common encryption (CENC) support
 
 * MSS: PlayReady encryption support
-
-* HLS: Mux audio and video streams from separate MP4 files (HLS/HDS)
 
 * HLS: Generation of I-frames playlist (EXT-X-I-FRAMES-ONLY)
 
@@ -75,13 +79,18 @@ For asynchronous file open using thread pool add `--with-threads` (nginx 1.7.11+
 
     ./configure --add-module=/path/to/nginx-vod-module --with-threads
 
+We recommend setting the gcc optimization parameter `-O3` - we got about 8% reduction in the mp4 parse time
+and frame processing time compared to the nginx default `-O`
+
+    ./configure --add-module=/path/to/nginx-vod-module --with-cc-opt="-O3"
+	
 To compile nginx with debug messages add `--with-debug`
 
     ./configure --add-module=/path/to/nginx-vod-module --with-debug
 
-To disable compiler optimizations (for debugging with gdb) add `CFLAGS="-g -O0"`
+To disable compiler optimizations (for debugging with gdb) add `--with-cc-opt="-O0"`
 
-	CFLAGS="-g -O0" ./configure ....
+    ./configure --add-module=/path/to/nginx-vod-module --with-cc-opt="-O0"
 
 #### RHEL/CentOS RPM
 If you are using RHEL or CentOS 6, you can install by setting up the repo:
@@ -119,7 +128,7 @@ Where:
 * location - the location specified in the nginx conf
 * fileuri - a URI to the mp4 file:
   * local mode - the full file path is determined according to the root / alias nginx.conf directives
-  * mapped mode - the full file path is determined according to the response from the upstream
+  * mapped mode - the full file path is determined according to the JSON received from the upstream / local file
   * remote mode - the mp4 file is read from upstream in chunks
   * Note: in mapped & remote modes, the URL of the upstream request is `http://<upstream>/<location>/<fileuri>?<extraargs>`
   (extraargs is determined by the vod_upstream_extra_args parameter)
@@ -154,7 +163,7 @@ The following parameters are supported on the URL path:
 #### Filename structure
 
 The structure of filename is:
-`<basename>[<fileparams>][<trackparams>].<extension>`
+`<basename>[<seqparams>][<fileparams>][<trackparams>][<langparams>].<extension>`
 
 Where:
 * basename + extension - the set of options is packager specific (the list below applies to the default settings):
@@ -163,12 +172,15 @@ Where:
   * hls master playlist - master.m3u8
   * hls media playlist - index.m3u8
   * mss - manifest
+* seqparams - can be used to select specific seqeuences by id, e.g. master-sseq1.m3u8.
 * fileparams - can be used to select specific files (URLs) when using multi URLs.
 	For example, manifest-f1.mpd will return an MPD only from the first URL.
 * trackparams - can be used to select specific audio/video tracks.
 	For example, manifest-a1.f4m will return an F4M containing only the first audio stream.
 	The default is to include the first audio and first video tracks of each file.
 	The tracks selected on the file name are AND-ed with the tracks selected with the /tracks/ path parameter.
+* langparams - can be used to filter audio tracks according to their language.
+	For example, master-leng.m3u8 will return only english audio tracks.
 
 ### Mapping response format
 
@@ -185,8 +197,9 @@ But first, a couple of definitions:
   * audio volume change
   * mix - can be used to merge several audio tracks together, or to merge the audio of source A with the video of source B
 2. `Clip` - the result of applying zero or more filters on a set of source clips
-3. `Sequence` - a set of clips that should be played one after the other. 
-4. `Set` - several sequences that play together as an adaptive set, each sequence must have the same number of clips.
+3. `Dynamic Clip` - a clip whose contents is not known in advance, e.g. targeted ad content
+4. `Sequence` - a set of clips that should be played one after the other. 
+5. `Set` - several sequences that play together as an adaptive set, each sequence must have the same number of clips.
 
 #### Simple mapping
 
@@ -390,6 +403,16 @@ Live fields:
 * `initialSegmentIndex` - integer, mandatory for non-continuous live streams, contains the
 	index of the first segment in the playlist. Whenever a clip is pushed out of the head of
 	the playlist, this value must be incremented by the number of segments in the clip.
+* `presentationEndTime` - integer, optional, when supplied the module will compare the 
+	current time to the supplied value, and signal the end of the live presentation
+	if `presentationEndTime` has passed. In HLS, for example, this parameter controls 
+	whether an `#EXT-X-ENDLIST` tag should be included in the media playlist.
+	When the parameter is not supplied, the module will not signal live presentation end.
+* `liveWindowDuration` - integer, optional, provides a way to override the number of live segments count
+	specified in the configuration. The value specified in the mapping is first translated to segment 
+	count by dividing it with `vod_segment_duration`.
+	If the result exceeds the absolute value specified in `vod_live_segment_count`, it will be ignored.
+	If the result is lower than 3 segments, it will be bumped up to 3.
 	
 #### Sequence
 
@@ -398,6 +421,22 @@ Mandatory fields:
 	the durations array specified on the set. If the durations array is not specified,
 	the clips array must contain a single element.
 	
+Optional fields:
+* `id` - a string that identifies the sequence. The id can be retrieved by `$vod_sequence_id`.
+* `language` - a 3-letter (ISO-639-2) language code, this field takes priority over any language
+	specified on the media file (MP4 mdhd atom)
+* `label` - a friendly string that identifies the sequence. if a language is specified,
+	a default label will be automatically derived by it - e.g. if language is `ita`, 
+	by default `italiano` will be used as the label.
+* `keyFrameDurations` - array of integers, containing the durations of the video key frames
+	in the sequence. Supplying the key frame durations enables the module to both:
+	1. align the segments to key frames 
+	2. report the correct segment durations in the manifest - providing an alternative to setting
+		`vod_manifest_segment_durations_mode` to `accurate`, which is not supported for multi clip
+		media sets (for performance reasons).
+* `firstKeyFrameOffset` - integer, offset of the first video key frame in the sequence, 
+	measured in milliseconds relative to `firstClipTime`. Defaults to 0 if not supplied.
+
 #### Clip (abstract)
 
 Mandatory fields:
@@ -406,6 +445,8 @@ Mandatory fields:
 	* rateFilter
 	* mixFilter
 	* gainFilter
+	* concat
+	* dynamic
 	
 #### Source clip
 
@@ -444,25 +485,163 @@ Mandatory fields:
 * `sources` - an array of Clip objects to mix. This array must contain at least one clip and
 	up to 32 clips.
 
-### DRM
+#### Concat clip
 
-Nginx-vod-module has the ability to perform on-the-fly encryption for MPEG DASH (CENC) and MSS Play Ready.
-The encryption is performed while serving a video/audio segment to the client, therefore, when working with DRM 
-it is highly recommended not to serve the content directly from nginx-vod-module to end-users.
+Mandatory fields:
+* `type` - a string with the value `concat`
+* `durations` - an array of integers representing MP4 durations in milliseconds,
+	this array must match the `paths` array in count and order.
+
+Optional fields:
+* `paths` - an array of strings, containings the paths of the MP4 files. Either `paths` or `clipIds` must be specified.
+* `clipIds` - an array of strings, containings the ids of source clips. 
+	The ids are translated to paths by issuing a request to the uri specified in `vod_source_clip_map_uri`.
+	Either `paths` or `clipIds` must be specified.
+* `tracks` - a string that specifies the tracks that should be used, the default is "v1-a1",
+	which means the first video track and the first audio track
+* `offset` - an integer in milliseconds that indicates the timestamp offset of the 
+	first frame in the concatenated stream relative to the clip start time
+* `basePath` - a string that should be added as a prefix to all the paths
+
+#### Dynamic clip
+
+Mandatory fields:
+* `type` - a string with the value `dynamic`
+* `id` - a string that uniquely identfies the dynamic clip, used for mapping the clip to its content
+
+### Security
+
+#### Authorization
+
+##### CDN-based delivery
+
+Media packaged by nginx-vod-module can be protected using CDN tokens, this works as follows:
+* Some application authenticates the user and decides whether the user should be allowed 
+	to watch a specific video. If the user is allowed, the application generates a tokenized
+	URL for the manifest of the video.
+* The CDN validates the token, and if found to be valid, forwards the request to nginx-vod-module 
+	on the origin. 
+* The nginx server builds the manifest response and generates tokens for the segment URLs
+	contained inside it. The module https://github.com/kaltura/nginx-secure-token-module can
+	be used to accomplish this task, it currently support Akamai tokens and CloudFront tokens.
+	See the readme of this module for more details.
+* The CDN validates the token on each segment that is requested.
+
+In this setup it also highly recommended to block direct access to the origin server by
+authenticating the CDN requests. Without this protection, a user who somehow gets the address
+of the origin will be able to bypass the CDN token enforcement. If using Akamai, this can
+be accomplished using https://github.com/refractalize/nginx_mod_akamai_g2o.
+For other CDNs, it may be possible to configure the CDN to send a secret header to the origin
+and then simply enforce the header using an nginx if statement:
+```
+		if ($http_x_secret_origin_header != "secret value") {
+			return 403;
+		}
+```
+
+In addition to the above, most CDNs support other access control settings, such as geo-location.
+These restrictions are completely transparent to the origin and should work well. 
+
+##### Direct delivery
+
+Deployments in which the media is pulled directly from nginx-vod-module can protect the media
+using nginx access control directives, such `allow`, `deny`, or `access_by_lua` (for more complex
+scenarios).
+
+In addition, it is possible to build a token based solution (as detailed in the previous section) 
+without a CDN, by having the nginx server validate the token. 
+The module https://github.com/kaltura/nginx-akamai-token-validate-module can be used
+to validate Akamai tokens. Locations on which the module is enabled will return 403 unless the 
+request contains a valid Akamai token. See the readme of this module for more details.
+
+#### URL encryption
+
+As an alternative to tokenization, URL encryption can be used to prevent an attacker from being
+able to craft a playable URL. URL encryption can be implemented with 
+https://github.com/kaltura/nginx-secure-token-module, and is supported for HLS and DASH (with 
+manifest format set to segmentlist). 
+
+In terms of security, the main advantage of CDN tokens over URL encryption is that CDN tokens
+usually expire, while encrypted URLs do not (someone who obtains a playable URL will be able to
+use it indefinitely)
+
+#### Media encryption
+
+Nginx-vod-module supports AES-128 and SAMPLE-AES HLS encryption schemes. The main difference between
+media encryption and DRM (detailed below) is the mechanism used to transfer the encryption key to 
+the client. With media encryption the key is fetched by the client by performing a simple GET request
+to nginx-vod-module, while with DRM the key is returned inside a vendor specific license response.
+
+Media encryption reduces the problem of securing the media to the need to secure the encryption key. 
+The media segment URLs (which compose the vast majority of the traffic) can be completely unprotected, 
+and easily cacheable by any proxies between the client and servers (unlike tokenization). 
+The encryption key request can then be protected using one of the methods mentioned above (CDN tokens,
+nginx access rules etc.). 
+
+In addition, it is possible to configure nginx-vod-module to return the encryption key over HTTPS
+while having the segments delivered over HTTP. The way to configure this is to set `vod_segments_base_url`
+to `http://nginx-vod-host` and set `vod_base_url` to `https://nginx-vod-host`.
+
+#### DRM
+
+Nginx-vod-module has the ability to perform on-the-fly encryption for MPEG DASH (CENC), MSS Play Ready and FairPlay HLS.
+As in the case of media encryption, the encryption is performed while serving a video/audio segment to the client, 
+therefore, when working with DRM it is recommended not to serve the content directly from nginx-vod-module to end-users.
 A more scalable architecture would be to use proxy servers or a CDN in order to cache the encrypted segments.
 
-In order to perform the encryption, this module needs several parameters, including key & key_id, these parameters
-are fetched from an external server via HTTP GET request.
+In order to perform the encryption, nginx-vod-module needs several parameters, including key & key_id, these parameters
+are fetched from an external server via HTTP GET requests.
 The vod_drm_upstream_location parameter specifies an nginx location that is used to access the DRM server,
 and the request uri is configured using vod_drm_request_uri (this parameter can include nginx variables). 
 The response of the DRM server is a JSON, with the following format:
 
-`[{"pssh": [{"data": "CAESEGMyZjg2MTczN2NjNGYzODIaB2thbHR1cmEiCjBfbmptaWlwbXAqBVNEX0hE", "uuid": "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"}], "key": "GzoNU9Dfwc//Iq3/zbzMUw==", "key_id": "YzJmODYxNzM3Y2M0ZjM4Mg=="}]`
+```
+[{
+	"pssh": [{
+			"data": "CAESEGMyZjg2MTczN2NjNGYzODIaB2thbHR1cmEiCjBfbmptaWlwbXAqBVNEX0hE", 
+			"uuid": "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+		}], 
+	"key": "GzoNU9Dfwc//Iq3/zbzMUw==", 
+	"key_id": "YzJmODYxNzM3Y2M0ZjM4Mg=="
+}]
+```
 
 * `pssh.data` - base64 encoded binary data, the format of this data is drm vendor specific
 * `pssh.uuid` - the drm system UUID, in this case, edef8ba9-79d6-4ace-a3c8-27dcd51d21ed stands for Widevine
 * `key` - base64 encoded encryption key (128 bit)
 * `key_id` - base64 encoded key identifier (128 bit)
+* `iv` - optional base64 encoded initialization vector (128 bit). The IV is currently used only in HLS (FairPlay), 
+	in the other protocols an IV is generated automatically by nginx-vod-module.
+
+##### Sample configuration
+
+Below is a sample configuration for Apple FairPlay HLS:
+```
+location ~ ^/fpshls/p/\d+/(sp/\d+/)?serveFlavor/entryId/([^/]+)/(.*) {
+	vod hls;
+	vod_hls_encryption_method sample-aes;
+	vod_hls_encryption_key_uri "skd://entry-$2";
+	vod_hls_encryption_key_format "com.apple.streamingkeydelivery";
+	vod_hls_encryption_key_format_versions "1";
+
+	vod_drm_enabled on;
+	vod_drm_request_uri "/udrm/system/ovp/$vod_suburi";
+
+	vod_last_modified_types *;
+	add_header Access-Control-Allow-Headers '*';
+	add_header Access-Control-Expose-Headers 'Server,range,Content-Length,Content-Range';
+	add_header Access-Control-Allow-Methods 'GET, HEAD, OPTIONS';
+	add_header Access-Control-Allow-Origin '*';
+	expires 100d;
+}
+```
+
+##### Verified configurations
+
+Following is a list of configurations that were tested and found working:
+* DASH/CENC with PlayReady & Widevine PSSH together
+* MSS PlayReady
+* HLS FairPlay
 
 ### Performance recommendations
 
@@ -475,10 +654,10 @@ The response of the DRM server is a JSON, with the following format:
 	In general, it's best to have nginx vod as close as possible to where the mp4 files are stored, 
 	and have the caching proxies as close as possible to the end users.
 2. Enable nginx-vod-module caches:
-	* vod_moov_cache - saves the need to re-read the video metadata for each segment. This cache should be rather large, in the order of GBs.
+	* vod_metadata_cache - saves the need to re-read the video metadata for each segment. This cache should be rather large, in the order of GBs.
 	* vod_response_cache - saves the responses of manifest requests. This cache may not be required when using a second layer of caching servers before nginx vod. 
 		No need to allocate a large buffer for this cache, 128M is probably more than enough for most deployments.
-	* vod_path_mapping_cache - for mapped mode only, few MBs is usually enough.
+	* vod_mapping_cache - for mapped mode only, few MBs is usually enough.
 	* nginx's open_file_cache - caches open file handles.
 
 	The hit/miss ratios of these caches can be tracked by enabling performance counters (vod_performance_counters) 
@@ -488,13 +667,14 @@ The response of the DRM server is a JSON, with the following format:
 4. In local & mapped modes, enable asynchronous file open - nginx has to be compiled with threads support, and vod_open_file_thread_pool 
 	has to be specified in nginx.conf. You can verify it works by looking at the performance counters on the vod status page - 
 	open_file vs. async_open_file
-5. The muxing overhead of the streams generated by this module can be reduced by changing the following parameters:
+5. When using DRM enabled DASH/MSS, if the video files have a single nalu per frame, set vod_min_single_nalu_per_frame_segment to non-zero.
+6. The muxing overhead of the streams generated by this module can be reduced by changing the following parameters:
 	* HDS - set vod_hds_generate_moof_atom to off
 	* HLS - set vod_hls_align_frames to off and vod_hls_interleave_frames to on
-6. Enable gzip compression on manifest responses - 
+7. Enable gzip compression on manifest responses - 
 
 	`gzip_types application/vnd.apple.mpegurl video/f4m application/dash+xml text/xml`
-7. Apply common nginx performance best practices, such as tcp_nodelay=on, client_header_timeout etc.
+8. Apply common nginx performance best practices, such as tcp_nodelay=on, client_header_timeout etc.
 
 ### Common configuration directives
 
@@ -541,7 +721,10 @@ http://host/hls/common-prefix,bitrate1,bitrate2,common-suffix.urlset/master.m3u8
 * **default**: `10s`
 * **context**: `http`, `server`, `location`
 
-Sets the segment duration in milliseconds.
+Sets the segment duration in milliseconds. It is highly recommended to use a segment duration that is a multiple of the GOP duration.
+If the segment duration is not a multiple of GOP duration, and `vod_align_segments_to_key_frames` is enabled, there could be significant
+differences between the segment duration that is reported in the manifest and the actual segment duration. This could also lead to
+the appearance of empty segments within the stream.
 
 #### vod_live_segment_count
 * **syntax**: `vod_live_segment_count count`
@@ -549,6 +732,9 @@ Sets the segment duration in milliseconds.
 * **context**: `http`, `server`, `location`
 
 Sets the number of segments that should be returned in a live manifest.
+If the value is positive, nginx vod returns at most vod_live_segment_count segments, the last of which contains the current server time.
+If the value is set to zero, the live manifest will contain all the segments that are fully contained in the mapping json time frame.
+If the value is negative, nginx vod will return the last -vod_live_segment_count segments contained in the mapping json.
 
 #### vod_bootstrap_segment_durations
 * **syntax**: `vod_bootstrap_segment_durations duration`
@@ -606,26 +792,26 @@ See the list of nginx variables added by this module below.
 The bitrate threshold for removing identical bitrates, streams whose bitrate differences are less than
 this value will be considered identical.
 
-#### vod_https_header_name
-* **syntax**: `vod_https_header_name name`
-* **default**: `empty`
+#### vod_base_url
+* **syntax**: `vod_base_url url`
+* **default**: `see below`
 * **context**: `http`, `server`, `location`
 
-Sets the name of an HTTP header whose existence determines whether the request was issued over HTTPS.
-If not set, the decision is made according to the protocol used to connect to the nginx server.
-A common scenario for using this setting is a load-balancer placed before the nginx that performs SSL-offloading.
+Sets the base URL (scheme + domain) that should be returned in manifest responses.
+The parameter value can contain variables, if the parameter evaluates to an empty string, relative URLs will be used.
+If not set, the base URL is determined as follows:
+1. If the request did not contain a host header (HTTP/1.0) relative URLs will be returned
+2. Otherwise, the base URL will be `$scheme://$http_host`
+The setting currently affects only HLS and DASH. In MSS and HDS, relative URLs are always returned.
 
 #### vod_segments_base_url
 * **syntax**: `vod_segments_base_url url`
-* **default**: `empty`
+* **default**: `see below`
 * **context**: `http`, `server`, `location`
 
-Sets the base URL (usually domain only) that should be used for delivering video segments.
-When empty, the host header sent on the request will be used as the domain.
-The scheme (http/https) used in the returned URLs is determined by:
-* the value of vod_segments_base_url, if it starts with http:// or https://
-* the existence of a request header whose name matches the value of vod_https_header_name, if vod_https_header_name is not empty
-* the type of connection used to connect to the nginx server
+Sets the base URL (scheme + domain) that should be used for delivering video segments.
+The parameter value can contain variables, if the parameter evaluates to an empty string, relative URLs will be used.
+If not set, vod_base_url will be used.
 The setting currently affects only HLS.
 
 #### vod_open_file_thread_pool
@@ -638,12 +824,12 @@ The thread pool must be defined with a thread_pool directive, if no pool name is
 This directive is supported only on nginx 1.7.11 or newer when compiling with --add-threads.
 Note: this directive currently disables the use of nginx's open_file_cache by nginx-vod-module
 
-#### vod_moov_cache
-* **syntax**: `vod_moov_cache zone_name zone_size [expiration]`
+#### vod_metadata_cache
+* **syntax**: `vod_metadata_cache zone_name zone_size [expiration]`
 * **default**: `off`
 * **context**: `http`, `server`, `location`
 
-Configures the size and shared memory object name of the moov atom cache
+Configures the size and shared memory object name of the video metadata cache. For MP4 files, this cache holds the moov atom.
 
 #### vod_response_cache
 * **syntax**: `vod_response_cache zone_name zone_size [expiration]`
@@ -668,12 +854,19 @@ This cache holds the following types of responses for live: DASH MPD, HLS index 
 
 Sets the size of the initial read operation of the MP4 file.
 
-#### vod_max_moov_size
-* **syntax**: `vod_max_moov_size size`
+#### vod_max_metadata_size
+* **syntax**: `vod_max_metadata_size size`
 * **default**: `128MB`
 * **context**: `http`, `server`, `location`
 
-Sets the maximum supported MP4 moov atom size.
+Sets the maximum supported video metadata size (for MP4 - moov atom size)
+
+#### vod_max_frames_size
+* **syntax**: `vod_max_frames_size size`
+* **default**: `16MB`
+* **context**: `http`, `server`, `location`
+
+Sets the limit on the total size of the frames of a single segment
 
 #### vod_cache_buffer_size
 * **syntax**: `vod_cache_buffer_size size`
@@ -711,19 +904,27 @@ Sets the size that is allocated for holding the response headers when issuing up
 Extra query string arguments that should be added to the upstream request (remote/mapped modes only).
 The parameter value can contain variables.
 
-#### vod_path_mapping_cache
-* **syntax**: `vod_path_mapping_cache zone_name zone_size [expiration]`
+#### vod_mapping_cache
+* **syntax**: `vod_mapping_cache zone_name zone_size [expiration]`
 * **default**: `off`
 * **context**: `http`, `server`, `location`
 
-Configures the size and shared memory object name of the path mapping cache for vod (mapped mode only).
+Configures the size and shared memory object name of the mapping cache for vod (mapped mode only).
 
-#### vod_live_path_mapping_cache
-* **syntax**: `vod_live_path_mapping_cache zone_name zone_size [expiration]`
+#### vod_live_mapping_cache
+* **syntax**: `vod_live_mapping_cache zone_name zone_size [expiration]`
 * **default**: `off`
 * **context**: `http`, `server`, `location`
 
-Configures the size and shared memory object name of the path mapping cache for live (mapped mode only).
+Configures the size and shared memory object name of the mapping cache for live (mapped mode only).
+
+#### vod_media_set_map_uri
+* **syntax**: `vod_media_set_map_uri uri`
+* **default**: `$vod_suburi`
+* **context**: `http`, `server`, `location`
+
+Sets the uri of media set mapping requests, the parameter value can contain variables.
+In case of multi url, $vod_suburi will be the current sub uri (a separate request is issued per sub URL)
 
 #### vod_path_response_prefix
 * **syntax**: `vod_path_response_prefix prefix`
@@ -802,6 +1003,25 @@ The name of the speed request parameter.
 
 Configures the shared memory object name of the performance counters
 
+#### vod_expires
+* **syntax**: `vod_expires time`
+* **default**: `none`
+* **context**: `http`, `server`, `location`
+
+Sets the value of the "Expires" and "Cache-Control" response headers for successful requests.
+This directive is similar to nginx's built-in `expires` directive, except that it only supports the expiration interval scenario
+(epoch, max, off, day time are not supported)
+Main motivation for using this directive instead of the built-in `expires` is to have different expiration for VOD and dynamic live content.
+If this directive is not specified, nginx-vod-module will not set the "Expires" / "Cache-Control" headers.
+
+#### vod_expires_live
+* **syntax**: `vod_expires_live time`
+* **default**: `none`
+* **context**: `http`, `server`, `location`
+
+Same as `vod_expires` (above) for dynamic live content.
+In DASH, for example, the expiration of the video fragments is determined by `vod_expires`, while `vod_expires_live` determines the expiration of the MPD.
+
 #### vod_last_modified
 * **syntax**: `vod_last_modified time`
 * **default**: `none`
@@ -820,6 +1040,49 @@ For changing live content (e.g. live DASH MPD), Last-Modified is set to the curr
 
 Sets the MIME types for which the Last-Modified header should be set.
 The special value "*" matches any MIME type.
+
+### Configuration directives - ad stitching (mapped mode only)
+
+#### vod_dynamic_mapping_cache
+* **syntax**: `vod_dynamic_mapping_cache zone_name zone_size [expiration]`
+* **default**: `off`
+* **context**: `http`, `server`, `location`
+
+Configures the size and shared memory object name of the cache that stores the mapping of dynamic clips.
+
+#### vod_dynamic_clip_map_uri
+* **syntax**: `vod_dynamic_clip_map_uri uri`
+* **default**: `none`
+* **context**: `http`, `server`, `location`
+
+Sets the uri that should be used to map dynamic clips. 
+The parameter value can contain variables, specifically, `$vod_clip_id` contains the id of the clip that should be mapped.
+The expected response from this uri is a JSON containing a concat clip object.
+
+#### vod_source_clip_map_uri
+* **syntax**: `vod_source_clip_map_uri uri`
+* **default**: `none`
+* **context**: `http`, `server`, `location`
+
+Sets the uri that should be used to map source clips defined using the clipIds property of concat. 
+The parameter value can contain variables, specifically, `$vod_clip_id` contains the id of the clip that should be mapped.
+The expected response from this uri is a JSON containing a source clip object.
+
+#### vod_redirect_segments_url
+* **syntax**: `vod_redirect_segments_url url`
+* **default**: `none`
+* **context**: `http`, `server`, `location`
+
+Sets a url to which requests for segments should be redirected.
+The parameter value can contain variables, specifically, `$vod_dynamic_mapping` contains a serialized representation of the mapping of dynamic clips.
+
+#### vod_apply_dynamic_mapping
+* **syntax**: `vod_apply_dynamic_mapping mapping`
+* **default**: `none`
+* **context**: `http`, `server`, `location`
+
+Maps dynamic clips to concat clips using the given expression, previously generated by `$vod_dynamic_mapping`.
+The parameter value can contain variables.
 
 ### Configuration directives - DRM
 
@@ -866,6 +1129,22 @@ Configures the size and shared memory object name of the drm info cache.
 
 Sets the uri of drm info requests, the parameter value can contain variables.
 In case of multi url, $vod_suburi will be the current sub uri (a separate drm info request is issued per sub URL)
+
+#### vod_min_single_nalu_per_frame_segment
+* **syntax**: `vod_min_single_nalu_per_frame_segment index`
+* **default**: `0`
+* **context**: `http`, `server`, `location`
+
+Sets the minimum segment index (1-based) that should be assumed to have a single h264 nalu per frame.
+If the value is 0, no assumption is being made on the number of nal units per frame.
+This setting only affects DASH and MSS configurations that have DRM enabled.
+
+When transcoding videos using libx264, by default, all frames have a single nal unit, except the first frame
+that contains an additional nalu with the libx264 copyright information. Setting this parameter to a value
+greater than 0 can provide a significant performance improvement, since the layout of the segment can be
+calculated in advance, allowing the module to:
+* Output segment buffers as they are generated (it doesn't have to wait for the whole segment to complete)
+* Avoid frame processing for requests that do not need the segment data (e.g. HEAD, range 0-0, etc.)
 
 ### Configuration directives - DASH
 
@@ -1001,7 +1280,29 @@ The prefix of segment file names, the actual file name is `seg-<index>-v<video-t
 * **default**: `encryption.key`
 * **context**: `http`, `server`, `location`
 
-The name of the encryption key file name (only relevant when vod_secret_key is used).
+The name of the encryption key file name, only relevant when encryption method is not `none`.
+
+#### vod_hls_encryption_key_uri
+* **syntax**: `vod_hls_encryption_key_uri uri`
+* **default**: `a url pointing to encryption.key`
+* **context**: `http`, `server`, `location`
+
+Sets the value of the URI attribute of EXT-X-KEY, only relevant when encryption method is not `none`.
+The parameter value can contain variables.
+
+#### vod_hls_encryption_key_format
+* **syntax**: `vod_hls_encryption_key_format format`
+* **default**: `none`
+* **context**: `http`, `server`, `location`
+
+Sets the value of the KEYFORMAT attribute of EXT-X-KEY, only relevant when encryption method is not `none`.
+
+#### vod_hls_encryption_key_format_versions
+* **syntax**: `vod_hls_encryption_key_format_versions versions`
+* **default**: `none`
+* **context**: `http`, `server`, `location`
+
+Sets the value of the KEYFORMATVERSIONS attribute of EXT-X-KEY, only relevant when encryption method is not `none`.
 
 #### vod_hls_interleave_frames
 * **syntax**: `vod_hls_interleave_frames on/off`
@@ -1018,6 +1319,14 @@ When disabled, on every switch between audio / video the muxer flushes the MPEG 
 
 When enabled, every video / audio frame is aligned to MPEG TS packet boundary,
 padding is added as needed.
+
+#### vod_hls_output_id3_timestamps
+* **syntax**: `vod_hls_output_id3_timestamps on/off`
+* **default**: `on`
+* **context**: `http`, `server`, `location`
+
+When enabled, an ID3 TEXT frame will be outputted in each TS segment, containing a JSON with the absolute segment timestamp.
+The timestamp is measured in milliseconds since the epoch (unixtime x 1000), the JSON structure is: `{"timestamp":1459779115000}`
 
 ### Configuration directives - MSS
 
@@ -1036,6 +1345,15 @@ The module adds the following nginx variables:
   `$vod_suburi` will have the value `http://<domain>/<location>/<prefix><middle1><postfix>/<filename>` 
   when processing the first uri.
 * `$vod_filepath` - in local / mapped modes, the file path of current sub uri. In remote mode, has the same value as `$vod_suburi`.
+* `$vod_sequence_id` - contains the id of the current sequence, if no id was specified in the mapping json this variable will be the same as `$vod_suburi`.
+* `$vod_clip_id` - the id of the current clip, this variable has a value during these phases:
+  1. Mapping of dynamic clips to concat clips
+  2. Mapping of source clip to paths
+* `$vod_dynamic_mapping` - a serialized representation of the mapping of dynamic clips to concat clips.
+* `$vod_request_params` - a serialized representation of the request params, e.g. 12-f2-v1-a1. The variable contains:
+  1. The segment index (for a segment request)
+  2. The sequence index
+  3. A selection of audio/video tracks
 
 Note: Configuration directives that can accept variables are explicitly marked as such.
 
@@ -1056,7 +1374,7 @@ Note: Configuration directives that can accept variables are explicitly marked a
 			vod_last_modified_types *;
 
 			# vod caches
-			vod_moov_cache moov_cache 512m;
+			vod_metadata_cache metadata_cache 512m;
 			vod_response_cache response_cache 128m;
 			
 			# gzip manifests
@@ -1110,9 +1428,9 @@ Note: Configuration directives that can accept variables are explicitly marked a
 			vod_last_modified_types *;
 
 			# vod caches
-			vod_moov_cache moov_cache 512m;
+			vod_metadata_cache metadata_cache 512m;
 			vod_response_cache response_cache 128m;
-			vod_path_mapping_cache mapping_cache 5m;
+			vod_mapping_cache mapping_cache 5m;
 			
 			# gzip manifests
 			gzip on;
@@ -1167,7 +1485,7 @@ Note: Configuration directives that can accept variables are explicitly marked a
 			vod_last_modified_types *;
 
 			# vod caches
-			vod_moov_cache moov_cache 512m;
+			vod_metadata_cache metadata_cache 512m;
 			vod_response_cache response_cache 128m;
 			
 			# gzip manifests

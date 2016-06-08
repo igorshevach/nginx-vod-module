@@ -1,6 +1,8 @@
 #include "mss_playready.h"
 #include "../mp4/mp4_encrypt_passthrough.h"
 #include "../mp4/mp4_encrypt.h"
+#include "../mp4/mp4_defs.h"
+#include "../udrm.h"
 
 // manifest constants
 #define VOD_MSS_PLAYREADY_PROTECTION_PREFIX						\
@@ -48,8 +50,8 @@ static u_char*
 mss_playready_write_protection_tag(void* context, u_char* p, media_set_t* media_set)
 {
 	// Note: taking only the first sequence, in mss all renditions must have the same key
-	mp4_encrypt_info_t* drm_info = (mp4_encrypt_info_t*)media_set->sequences[0].drm_info;
-	mp4_encrypt_system_info_t* cur_info;
+	drm_info_t* drm_info = (drm_info_t*)media_set->sequences[0].drm_info;
+	drm_system_info_t* cur_info;
 	vod_str_t base64;
 
 	p = vod_copy(p, VOD_MSS_PLAYREADY_PROTECTION_PREFIX, sizeof(VOD_MSS_PLAYREADY_PROTECTION_PREFIX) - 1);
@@ -75,8 +77,8 @@ mss_playready_build_manifest(
 	vod_str_t* result)
 {
 	// Note: taking only the first sequence, in mss all renditions must have the same key
-	mp4_encrypt_info_t* drm_info = (mp4_encrypt_info_t*)media_set->sequences[0].drm_info;
-	mp4_encrypt_system_info_t* cur_info;
+	drm_info_t* drm_info = (drm_info_t*)media_set->sequences[0].drm_info;
+	drm_system_info_t* cur_info;
 	size_t extra_tags_size;
 
 	extra_tags_size = sizeof(VOD_MSS_PLAYREADY_PROTECTION_PREFIX) - 1 + sizeof(VOD_MSS_PLAYREADY_PROTECTION_SUFFIX) - 1;
@@ -190,17 +192,17 @@ mss_playready_audio_build_fragment_header(
 }
 
 static vod_status_t
-mss_playready_video_write_fragment_header(mp4_encrypt_video_state_t* state)
+mss_playready_video_build_fragment_header(
+	mp4_encrypt_video_state_t* state,
+	vod_str_t* fragment_header, 
+	size_t* total_fragment_size)
 {
 	mss_playready_video_extra_traf_atoms_context writer_context;
-	vod_str_t fragment_header;
-	size_t total_fragment_size;
-	vod_status_t rc;
 
 	writer_context.uuid_piff_atom_size = ATOM_HEADER_SIZE + sizeof(uuid_piff_atom_t) + state->auxiliary_data.pos - state->auxiliary_data.start;
 	writer_context.state = state;
 
-	rc = mss_packager_build_fragment_header(
+	return mss_packager_build_fragment_header(
 		state->base.request_context,
 		state->base.media_set,
 		state->base.segment_index,
@@ -208,27 +210,8 @@ mss_playready_video_write_fragment_header(mp4_encrypt_video_state_t* state)
 		mss_playready_video_write_extra_traf_atoms,
 		&writer_context,
 		FALSE,
-		&fragment_header,
-		&total_fragment_size);
-	if (rc != VOD_OK)
-	{
-		vod_log_debug1(VOD_LOG_DEBUG_LEVEL, state->base.request_context->log, 0,
-			"mss_playready_video_write_fragment_header: mss_packager_build_fragment_header failed %i", rc);
-		return rc;
-	}
-
-	rc = state->base.segment_writer.write_head(
-		state->base.segment_writer.context,
-		fragment_header.data,
-		fragment_header.len);
-	if (rc != VOD_OK)
-	{
-		vod_log_debug1(VOD_LOG_DEBUG_LEVEL, state->base.request_context->log, 0,
-			"mss_playready_video_write_fragment_header: write_head failed %i", rc);
-		return rc;
-	}
-
-	return VOD_OK;
+		fragment_header,
+		total_fragment_size);
 }
 
 static u_char*
@@ -274,6 +257,7 @@ mss_playready_get_fragment_writer(
 	request_context_t* request_context,
 	media_set_t* media_set,
 	uint32_t segment_index,
+	bool_t single_nalu_per_frame,
 	segment_writer_t* segment_writer,
 	const u_char* iv,
 	bool_t size_only,
@@ -321,9 +305,12 @@ mss_playready_get_fragment_writer(
 			request_context,
 			media_set,
 			segment_index,
-			mss_playready_video_write_fragment_header,
+			single_nalu_per_frame,
+			mss_playready_video_build_fragment_header,
 			segment_writer,
-			iv);
+			iv, 
+			fragment_header,
+			total_fragment_size);
 
 	case MEDIA_TYPE_AUDIO:
 		rc = mp4_encrypt_audio_get_fragment_writer(

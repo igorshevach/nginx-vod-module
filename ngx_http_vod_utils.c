@@ -131,35 +131,50 @@ ngx_http_vod_memrchr(const u_char *s, int c, size_t n)
 	return NULL;
 }
 
-void
+ngx_int_t
 ngx_http_vod_get_base_url(
 	ngx_http_request_t* r,
-	ngx_str_t* https_header_name,
-	ngx_str_t* conf_base_url,
-	ngx_flag_t conf_base_url_has_schema,
+	ngx_http_complex_value_t* conf_base_url,
 	ngx_str_t* file_uri,
-	ngx_str_t* base_url)
+	ngx_str_t* result)
 {
 	ngx_flag_t use_https;
-	ngx_str_t* host_name;
+	ngx_str_t base_url;
+	ngx_str_t* host_name = NULL;
 	size_t uri_path_len;
 	size_t result_size;
 	u_char* last_slash;
 	u_char* p;
 
-	if (conf_base_url == NULL || conf_base_url->len == 0)
+	if (conf_base_url != NULL)
+	{
+		if (ngx_http_complex_value(
+			r,
+			conf_base_url,
+			&base_url) != NGX_OK)
+		{
+			return NGX_ERROR;
+		}
+
+		if (base_url.len == 0)
+		{
+			// conf base url evaluated to empty string, use relative URLs
+			return NGX_OK;
+		}
+
+		result_size = base_url.len;
+	}
+	else
 	{
 		// when the request has no host header (HTTP 1.0), use relative URLs
 		if (r->headers_in.host == NULL)
 		{
-			return;
+			return NGX_OK;
 		}
 
 		host_name = &r->headers_in.host->value;
-	}
-	else
-	{
-		host_name = conf_base_url;
+
+		result_size = sizeof("https://") - 1 + host_name->len;
 	}
 
 	if (file_uri->len)
@@ -167,7 +182,9 @@ ngx_http_vod_get_base_url(
 		last_slash = ngx_http_vod_memrchr(file_uri->data, '/', file_uri->len);
 		if (last_slash == NULL)
 		{
-			return;
+			vod_log_error(VOD_LOG_ERR, r->connection->log, 0,
+				"ngx_http_vod_get_base_url: no slash found in uri %V", file_uri);
+			return NGX_ERROR;
 		}
 
 		uri_path_len = last_slash + 1 - file_uri->data;
@@ -178,31 +195,29 @@ ngx_http_vod_get_base_url(
 	}
 
 	// allocate the base url
-	result_size = sizeof("https://") - 1 + host_name->len + uri_path_len + sizeof("/");
+	result_size += uri_path_len + sizeof("/");
 	p = ngx_palloc(r->pool, result_size);
 	if (p == NULL)
 	{
-		return;
+		ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+			"ngx_http_vod_get_base_url: ngx_palloc failed");
+		return NGX_ERROR;
 	}
 
 	// build the url
-	base_url->data = p;
+	result->data = p;
 
-	if (!conf_base_url_has_schema)
+	if (conf_base_url != NULL)
 	{
-		// decide whether to use http or https
-		if (https_header_name->len)
-		{
-			use_https = ngx_http_vod_header_exists(r, https_header_name);
-		}
-		else
-		{
+		p = vod_copy(p, base_url.data, base_url.len);
+	}
+	else
+	{
 #if (NGX_HTTP_SSL)
-			use_https = (r->connection->ssl != NULL);
+		use_https = (r->connection->ssl != NULL);
 #else
-			use_https = 0;
+		use_https = 0;
 #endif
-		}
 
 		if (use_https)
 		{
@@ -212,20 +227,24 @@ ngx_http_vod_get_base_url(
 		{
 			p = ngx_copy(p, "http://", sizeof("http://") - 1);
 		}
+
+		p = ngx_copy(p, host_name->data, host_name->len);
 	}
 
-	p = ngx_copy(p, host_name->data, host_name->len);
 	p = ngx_copy(p, file_uri->data, uri_path_len);
 	*p = '\0';
 
-	base_url->len = p - base_url->data;
+	result->len = p - result->data;
 
-	if (base_url->len > result_size)
+	if (result->len > result_size)
 	{
 		vod_log_error(VOD_LOG_ERR, r->connection->log, 0,
 			"ngx_http_vod_get_base_url: result length %uz exceeded allocated length %uz",
-			base_url->len, result_size);
+			result->len, result_size);
+		return NGX_ERROR;
 	}
+
+	return NGX_OK;
 }
 
 ngx_int_t
@@ -342,7 +361,6 @@ ngx_http_vod_range_parse(ngx_str_t* range, off_t content_length, off_t* out_star
 
     if (end >= content_length) {
         end = content_length;
-
     } else {
         end++;
     }
@@ -357,4 +375,101 @@ found:
     *out_end = end;
 
     return NGX_OK;
+}
+
+// A run down version of ngx_http_set_expires
+ngx_int_t
+ngx_http_vod_set_expires(ngx_http_request_t *r, time_t expires_time)
+{
+	size_t               len;
+	time_t               now, max_age;
+	ngx_uint_t           i;
+	ngx_table_elt_t     *e, *cc, **ccp;
+
+	e = r->headers_out.expires;
+
+	if (e == NULL) {
+
+		e = ngx_list_push(&r->headers_out.headers);
+		if (e == NULL) {
+			return NGX_ERROR;
+		}
+
+		r->headers_out.expires = e;
+
+		e->hash = 1;
+		ngx_str_set(&e->key, "Expires");
+	}
+
+	len = sizeof("Mon, 28 Sep 1970 06:00:00 GMT");
+	e->value.len = len - 1;
+
+	ccp = r->headers_out.cache_control.elts;
+
+	if (ccp == NULL) {
+
+		if (ngx_array_init(&r->headers_out.cache_control, r->pool,
+			1, sizeof(ngx_table_elt_t *))
+			!= NGX_OK)
+		{
+			return NGX_ERROR;
+		}
+
+		ccp = ngx_array_push(&r->headers_out.cache_control);
+		if (ccp == NULL) {
+			return NGX_ERROR;
+		}
+
+		cc = ngx_list_push(&r->headers_out.headers);
+		if (cc == NULL) {
+			return NGX_ERROR;
+		}
+
+		cc->hash = 1;
+		ngx_str_set(&cc->key, "Cache-Control");
+		*ccp = cc;
+
+	}
+	else {
+		for (i = 1; i < r->headers_out.cache_control.nelts; i++) {
+			ccp[i]->hash = 0;
+		}
+
+		cc = ccp[0];
+	}
+
+	e->value.data = ngx_pnalloc(r->pool, len);
+	if (e->value.data == NULL) {
+		return NGX_ERROR;
+	}
+
+	if (expires_time == 0) {
+		ngx_memcpy(e->value.data, ngx_cached_http_time.data,
+			ngx_cached_http_time.len + 1);
+		ngx_str_set(&cc->value, "max-age=0");
+		return NGX_OK;
+	}
+
+	now = ngx_time();
+
+	max_age = expires_time;
+	expires_time += now;
+
+	ngx_http_time(e->value.data, expires_time);
+
+	if (max_age < 0) {
+		ngx_str_set(&cc->value, "no-cache");
+		return NGX_OK;
+	}
+
+	cc->value.data = ngx_pnalloc(r->pool,
+		sizeof("max-age=") + NGX_TIME_T_LEN + 1);
+	if (cc->value.data == NULL) {
+		return NGX_ERROR;
+	}
+
+	cc->value.len = ngx_sprintf(cc->value.data, "max-age=%T", max_age)
+		- cc->value.data;
+
+	return NGX_OK;
 }

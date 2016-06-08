@@ -141,6 +141,19 @@ parse_utils_parse_variable_base64_string(vod_pool_t* pool, vod_str_t* str, vod_s
 }
 
 u_char*
+parse_utils_extract_uint64_token(u_char* start_pos, u_char* end_pos, uint64_t* result)
+{
+    uint64_t value = 0;
+    
+    for (; start_pos < end_pos && *start_pos >= '0' && *start_pos <= '9'; start_pos++)
+    {
+        value = value * 10 + *start_pos - '0';
+    }
+    *result = value;
+    return start_pos;
+}
+
+u_char*
 parse_utils_extract_uint32_token(u_char* start_pos, u_char* end_pos, uint32_t* result)
 {
 	uint32_t value = 0;

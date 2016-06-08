@@ -3,7 +3,7 @@
 
 // includes
 #include "hls_encryption.h"
-#include "../mp4/mp4_parser.h"
+#include "../media_format.h"
 #include "../write_buffer_queue.h"
 #include "media_filter.h"
 
@@ -43,6 +43,7 @@ typedef struct {
 	
 	// frame state
 	unsigned cc;
+	unsigned initial_cc;
 	u_char* cur_pes_size_ptr;
 	uint32_t pes_bytes_written;
 	uint32_t flushed_frame_bytes;
@@ -61,8 +62,10 @@ typedef struct {
 
 typedef struct {
 	request_context_t* request_context;
-
 	hls_encryption_params_t* encryption_params;
+	uint32_t segment_index;
+
+	u_char* pat_packet_start;
 	u_char* pmt_packet_start;
 	u_char* pmt_packet_end;
 	u_char* pmt_packet_pos;
@@ -83,13 +86,13 @@ vod_status_t mpegts_encoder_init_streams(
 	uint32_t segment_index);
 
 void mpegts_encoder_finalize_streams(
-	mpegts_encoder_init_streams_state_t* stream_state);
+	mpegts_encoder_init_streams_state_t* stream_state, 
+	vod_str_t* ts_header);
 
 vod_status_t mpegts_encoder_init(
 	mpegts_encoder_state_t* state,
 	mpegts_encoder_init_streams_state_t* stream_state,
 	media_track_t* track,
-	request_context_t* request_context,
 	write_buffer_queue_t* queue,
 	bool_t interleave_frames,
 	bool_t align_frames);

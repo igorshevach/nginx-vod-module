@@ -1,10 +1,12 @@
 #include "filter.h"
 #include "audio_filter.h"
 #include "rate_filter.h"
+#include "concat_clip.h"
 #include "../media_set.h"
 
 // typedefs
 typedef struct {
+	request_context_t* request_context;
 	media_sequence_t* sequence;
 	media_clip_filtered_t* output_clip;
 	media_track_t* output_track;
@@ -46,7 +48,15 @@ filter_get_clip_track_count(media_clip_t* clip, uint32_t* track_count)
 	}
 
 	// recursively count child sources
-	sources_end = clip->sources + clip->source_count;
+	if (clip->type == MEDIA_CLIP_CONCAT)
+	{
+		sources_end = clip->sources + 1;
+	}
+	else
+	{
+		sources_end = clip->sources + clip->source_count;
+	}
+
 	for (cur_source = clip->sources; cur_source < sources_end; cur_source++)
 	{
 		filter_get_clip_track_count(*cur_source, track_count);
@@ -90,8 +100,6 @@ filter_init_filtered_clip_from_source(
 {
 	media_track_t* cur_track;
 
-	state->output_clip->mvhd_atom = source->track_array.mvhd_atom;
-
 	// copy video tracks then audio tracks so that video tracks will appear first
 	for (cur_track = source->track_array.first_track; cur_track < source->track_array.last_track; cur_track++)
 	{
@@ -110,7 +118,7 @@ filter_init_filtered_clip_from_source(
 	}
 }
 
-static void
+static vod_status_t
 filter_scale_video_tracks(filters_init_state_t* state, media_clip_t* clip, uint32_t speed_nom, uint32_t speed_denom)
 {
 	media_clip_rate_filter_t* rate_filter;
@@ -119,15 +127,14 @@ filter_scale_video_tracks(filters_init_state_t* state, media_clip_t* clip, uint3
 	media_track_t* cur_track;
 	media_clip_t** cur_source;
 	media_clip_t** sources_end;
+	vod_status_t rc;
 
 	if (clip->type == MEDIA_CLIP_SOURCE)
 	{
 		source = vod_container_of(clip, media_clip_source_t, base);
 
-		if (state->source_count == 0)
-		{
-			state->output_clip->mvhd_atom = source->track_array.mvhd_atom;
-		}
+		// reset the sequence pointer, may have shifted in case one more sequences were removed
+		source->sequence = state->sequence;
 
 		for (cur_track = source->track_array.first_track;
 			cur_track < source->track_array.last_track;
@@ -159,7 +166,7 @@ filter_scale_video_tracks(filters_init_state_t* state, media_clip_t* clip, uint3
 		}
 
 		state->source_count++;
-		return;
+		return VOD_OK;
 	}
 
 	// recursively filter sources
@@ -173,11 +180,51 @@ filter_scale_video_tracks(filters_init_state_t* state, media_clip_t* clip, uint3
 	default:;
 	}
 
+	if (clip->type == MEDIA_CLIP_CONCAT && clip->source_count > 1)
+	{
+		rc = concat_clip_concat(state->request_context, clip);
+		if (rc != VOD_OK)
+		{
+			return rc;
+		}
+	}
+
 	sources_end = clip->sources + clip->source_count;
 	for (cur_source = clip->sources; cur_source < sources_end; cur_source++)
 	{
-		filter_scale_video_tracks(state, *cur_source, speed_nom, speed_denom);
+		rc = filter_scale_video_tracks(state, *cur_source, speed_nom, speed_denom);
+		if (rc != VOD_OK)
+		{
+			return rc;
+		}
 	}
+
+	return VOD_OK;
+}
+
+static vod_status_t
+filter_validate_consistent_codecs(
+	request_context_t* request_context,
+	media_clip_filtered_t* first_clip, 
+	media_clip_filtered_t* cur_clip)
+{
+	media_track_t* first_clip_track;
+	media_track_t* cur_clip_track;
+
+	for (first_clip_track = first_clip->first_track, cur_clip_track = cur_clip->first_track;
+		first_clip_track < first_clip->last_track;
+		first_clip_track++, cur_clip_track++)
+	{
+		if (first_clip_track->media_info.codec_id != cur_clip_track->media_info.codec_id)
+		{
+			vod_log_error(VOD_LOG_ERR, request_context->log, 0,
+				"filter_validate_consistent_codecs: track codec changed, current=%uD initial=%uD",
+				cur_clip_track->media_info.codec_id, first_clip_track->media_info.codec_id);
+			return VOD_BAD_REQUEST;
+		}
+	}
+
+	return VOD_OK;
 }
 
 vod_status_t
@@ -195,6 +242,7 @@ filter_init_filtered_clips(
 	uint32_t track_count[MEDIA_TYPE_COUNT];
 	uint32_t max_duration = 0;
 	uint32_t clip_index;
+	vod_status_t rc;
 
 	media_set->audio_filtering_needed = FALSE;
 	media_set->track_count[MEDIA_TYPE_VIDEO] = 0;
@@ -252,20 +300,29 @@ filter_init_filtered_clips(
 			}
 		}
 
-		// update the media set total track count
+		// set the sequence media type
+		sequence->total_track_count = sequence->track_count[MEDIA_TYPE_VIDEO] + sequence->track_count[MEDIA_TYPE_AUDIO];
+		switch (sequence->total_track_count)
+		{
+		case 0:
+			media_set->sequence_count--;
+			media_set->sequences_end--;
+			vod_memmove(sequence, sequence + 1, (u_char*)media_set->sequences_end - (u_char*)sequence);
+			sequence--;
+			continue;
+
+		case 1:
+			sequence->media_type = sequence->track_count[MEDIA_TYPE_VIDEO] > 0 ? MEDIA_TYPE_VIDEO : MEDIA_TYPE_AUDIO;
+			break;
+
+		default:
+			sequence->media_type = MEDIA_TYPE_NONE;
+			break;
+		}
+
+		// update the media set track count
 		media_set->track_count[MEDIA_TYPE_VIDEO] += sequence->track_count[MEDIA_TYPE_VIDEO];
 		media_set->track_count[MEDIA_TYPE_AUDIO] += sequence->track_count[MEDIA_TYPE_AUDIO];
-		sequence->total_track_count = sequence->track_count[MEDIA_TYPE_VIDEO] + sequence->track_count[MEDIA_TYPE_AUDIO];
-
-		// set the sequence media type
-		if (sequence->total_track_count == 1)
-		{
-			sequence->media_type = sequence->track_count[MEDIA_TYPE_VIDEO] > 0 ? MEDIA_TYPE_VIDEO : MEDIA_TYPE_AUDIO;
-		}
-		else
-		{
-			sequence->media_type = MEDIA_TYPE_NONE;
-		}
 
 		// initialize the filtered clips array
 		sequence->filtered_clips = output_clip;
@@ -284,6 +341,8 @@ filter_init_filtered_clips(
 			"filter_init_filtered_clips: vod_alloc failed (2)");
 		return VOD_ALLOC_FAILED;
 	}
+	init_state.request_context = request_context;
+
 	media_set->filtered_tracks = init_state.output_track;
 
 	for (clip_index = 0; clip_index < media_set->clip_count; clip_index++)
@@ -309,18 +368,19 @@ filter_init_filtered_clips(
 			if (input_clip->type == MEDIA_CLIP_SOURCE)
 			{
 				filter_init_filtered_clip_from_source(&init_state, (media_clip_source_t*)input_clip);
+
+				// reset the sequence pointer, may have shifted in case one more sequences were removed
+				((media_clip_source_t*)input_clip)->sequence = sequence;
 			}
 			else
 			{
 				init_state.has_audio_frames = FALSE;
 				init_state.source_count = 0;
 
-				filter_scale_video_tracks(&init_state, input_clip, 100, 100);
-
-				if (init_state.source_count != 1)
+				rc = filter_scale_video_tracks(&init_state, input_clip, 100, 100);
+				if (rc != VOD_OK)
 				{
-					// got more than one mvhd, clear it
-					vod_memzero(&output_clip->mvhd_atom, sizeof(output_clip->mvhd_atom));
+					return rc;
 				}
 			}
 
@@ -344,6 +404,19 @@ filter_init_filtered_clips(
 			}
 
 			output_clip->last_track = init_state.output_track;
+
+			// make sure all clips have the same codecs
+			if (clip_index > 0)
+			{
+				rc = filter_validate_consistent_codecs(
+					request_context,
+					sequence->filtered_clips,
+					output_clip);
+				if (rc != VOD_OK)
+				{
+					return rc;
+				}
+			}
 
 			// calculate the max duration, only relevant in case of single clip
 			if (output_clip->longest_track[MEDIA_TYPE_VIDEO] != NULL &&

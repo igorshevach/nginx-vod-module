@@ -51,11 +51,8 @@ typedef struct {
 	request_context_t request_context;
 	media_set_t media_set;
 	request_params_t request_params;
-	const struct ngx_http_vod_request_s* request;
 	ngx_http_request_t* r;
 	struct ngx_http_vod_loc_conf_s* conf;
-	media_sequence_t* cur_sequence;
-	media_clip_source_t** cur_source;
 } ngx_http_vod_submodule_context_t;
 
 // submodule request
@@ -63,6 +60,8 @@ struct ngx_http_vod_request_s {
 	int flags;
 	int parse_type;
 	int request_class;
+	int codecs_mask;
+	uint32_t timescale;
 	
 	ngx_int_t (*handle_metadata_request)(
 		// in

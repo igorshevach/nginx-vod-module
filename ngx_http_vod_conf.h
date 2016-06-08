@@ -29,24 +29,32 @@ struct ngx_http_vod_loc_conf_s {
 	ngx_str_t multi_uri_suffix;
 	segmenter_conf_t segmenter;
 	ngx_http_complex_value_t *secret_key;
-	ngx_str_t https_header_name;
-	ngx_str_t segments_base_url;
-	ngx_flag_t segments_base_url_has_scheme;
-	ngx_buffer_cache_t* moov_cache;
+	ngx_http_complex_value_t *base_url;
+	ngx_http_complex_value_t *segments_base_url;
+	ngx_buffer_cache_t* metadata_cache;
 	ngx_buffer_cache_t* response_cache[CACHE_TYPE_COUNT];
 	size_t initial_read_size;
-	size_t max_moov_size;
+	size_t max_metadata_size;
+	size_t max_frames_size;
 	size_t cache_buffer_size;
+	buffer_pool_t* output_buffer_pool;
 	size_t max_upstream_headers_size;
 	ngx_flag_t ignore_edit_list;
 	ngx_http_complex_value_t *upstream_extra_args;
-	ngx_buffer_cache_t* path_mapping_cache[CACHE_TYPE_COUNT];
+	ngx_buffer_cache_t* mapping_cache[CACHE_TYPE_COUNT];
+	ngx_buffer_cache_t* dynamic_mapping_cache;
 	ngx_str_t path_response_prefix;
 	ngx_str_t path_response_postfix;
 	size_t max_mapping_response_size;
+	ngx_http_complex_value_t* dynamic_clip_map_uri;
+	ngx_http_complex_value_t* source_clip_map_uri;
+	ngx_http_complex_value_t* redirect_segments_url;
+	ngx_http_complex_value_t* media_set_map_uri;
+	ngx_http_complex_value_t* apply_dynamic_mapping;
 	ngx_str_t fallback_upstream_location;
 	ngx_table_elt_t proxy_header;
 
+	time_t expires[CACHE_TYPE_COUNT];
 	time_t last_modified_time;
 	ngx_hash_t  last_modified_types;
 	ngx_array_t *last_modified_types_keys;
@@ -57,6 +65,7 @@ struct ngx_http_vod_loc_conf_s {
 	size_t drm_max_info_length;
 	ngx_buffer_cache_t* drm_info_cache;
 	ngx_http_complex_value_t *drm_request_uri;
+	ngx_uint_t min_single_nalu_per_frame_segment;
 
 	ngx_str_t clip_to_param_name;
 	ngx_str_t clip_from_param_name;

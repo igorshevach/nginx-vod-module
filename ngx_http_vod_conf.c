@@ -6,16 +6,21 @@
 #include "ngx_http_vod_status.h"
 #include "ngx_perf_counters.h"
 #include "ngx_buffer_cache.h"
-#include "ngx_http_vod_udrm.h"
 #include "vod/media_set_parser.h"
+#include "vod/buffer_pool.h"
 #include "vod/common.h"
+#include "vod/udrm.h"
 
-static ngx_str_t  ngx_http_vod_last_modified_default_types[] = {
+static ngx_str_t ngx_http_vod_last_modified_default_types[] = {
 	ngx_null_string
 };
 
-static ngx_str_t  ngx_http_vod_filepath = ngx_string("vod_filepath");
-static ngx_str_t  ngx_http_vod_suburi = ngx_string("vod_suburi");
+static ngx_str_t ngx_http_vod_filepath = ngx_string("vod_filepath");
+static ngx_str_t ngx_http_vod_suburi = ngx_string("vod_suburi");
+static ngx_str_t ngx_http_vod_sequence_id = ngx_string("vod_sequence_id");
+static ngx_str_t ngx_http_vod_clip_id = ngx_string("vod_clip_id");
+static ngx_str_t ngx_http_vod_dynamic_mapping = ngx_string("vod_dynamic_mapping");
+static ngx_str_t ngx_http_vod_request_params = ngx_string("vod_request_params");
 
 static ngx_int_t
 ngx_http_vod_add_variables(ngx_conf_t *cf)
@@ -40,6 +45,42 @@ ngx_http_vod_add_variables(ngx_conf_t *cf)
 
 	var->get_handler = ngx_http_vod_set_suburi_var;
 
+	// sequence id
+	var = ngx_http_add_variable(cf, &ngx_http_vod_sequence_id, NGX_HTTP_VAR_NOCACHEABLE);
+	if (var == NULL)
+	{
+		return NGX_ERROR;
+	}
+
+	var->get_handler = ngx_http_vod_set_sequence_id_var;
+
+	// clip id
+	var = ngx_http_add_variable(cf, &ngx_http_vod_clip_id, NGX_HTTP_VAR_NOCACHEABLE);
+	if (var == NULL)
+	{
+		return NGX_ERROR;
+	}
+
+	var->get_handler = ngx_http_vod_set_clip_id_var;
+
+	// dynamic mapping
+	var = ngx_http_add_variable(cf, &ngx_http_vod_dynamic_mapping, NGX_HTTP_VAR_NOCACHEABLE);
+	if (var == NULL)
+	{
+		return NGX_ERROR;
+	}
+
+	var->get_handler = ngx_http_vod_set_dynamic_mapping_var;
+
+	// request params
+	var = ngx_http_add_variable(cf, &ngx_http_vod_request_params, NGX_HTTP_VAR_NOCACHEABLE);
+	if (var == NULL)
+	{
+		return NGX_ERROR;
+	}
+
+	var->get_handler = ngx_http_vod_set_request_params_var;
+
 	return NGX_OK;
 }
 
@@ -56,15 +97,21 @@ ngx_http_vod_init_parsers(ngx_conf_t *cf)
 		return NGX_ERROR;
 	}
 
-	rc = ngx_http_vod_udrm_init_parser(cf);
-	if (rc != NGX_OK)
+	rc = udrm_init_parser(cf->pool, cf->temp_pool);
+	if (rc != VOD_OK)
 	{
 		ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
 			"failed to initialize udrm parser %i", rc);
 		return NGX_ERROR;
 	}
 
-	ngx_child_request_init();
+	rc = ngx_child_request_init(cf);
+	if (rc != VOD_OK)
+	{
+		ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+			"failed to initialize hide headers hash %i", rc);
+		return NGX_ERROR;
+	}
 
 	return NGX_OK;
 }
@@ -87,23 +134,27 @@ ngx_http_vod_create_loc_conf(ngx_conf_t *cf)
 	conf->submodule.parse_uri_file_name = NGX_CONF_UNSET_PTR;
 	conf->request_handler = NGX_CONF_UNSET_PTR;
 	conf->segmenter.segment_duration = NGX_CONF_UNSET_UINT;
-	conf->segmenter.live_segment_count = NGX_CONF_UNSET_UINT;
+	conf->segmenter.live_segment_count = NGX_CONF_UNSET;
 	conf->segmenter.bootstrap_segments = NGX_CONF_UNSET_PTR;
 	conf->segmenter.align_to_key_frames = NGX_CONF_UNSET;
 	conf->segmenter.get_segment_count = NGX_CONF_UNSET_PTR;
 	conf->segmenter.get_segment_durations = NGX_CONF_UNSET_PTR;
 	conf->initial_read_size = NGX_CONF_UNSET_SIZE;
-	conf->max_moov_size = NGX_CONF_UNSET_SIZE;
+	conf->max_metadata_size = NGX_CONF_UNSET_SIZE;
+	conf->max_frames_size = NGX_CONF_UNSET_SIZE;
 	conf->cache_buffer_size = NGX_CONF_UNSET_SIZE;
 	conf->max_upstream_headers_size = NGX_CONF_UNSET_SIZE;
 	conf->ignore_edit_list = NGX_CONF_UNSET;
 	conf->max_mapping_response_size = NGX_CONF_UNSET_SIZE;
 
+	conf->expires[CACHE_TYPE_VOD] = NGX_CONF_UNSET;
+	conf->expires[CACHE_TYPE_LIVE] = NGX_CONF_UNSET;
 	conf->last_modified_time = NGX_CONF_UNSET;
 
 	conf->drm_enabled = NGX_CONF_UNSET;
 	conf->drm_clear_lead_segment_count = NGX_CONF_UNSET_UINT;
 	conf->drm_max_info_length = NGX_CONF_UNSET_SIZE;
+	conf->min_single_nalu_per_frame_segment = NGX_CONF_UNSET_UINT;
 
 #if (NGX_THREADS)
 	conf->open_file_thread_pool = NGX_CONF_UNSET_PTR;
@@ -146,7 +197,7 @@ ngx_http_vod_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 	ngx_conf_merge_str_value(conf->multi_uri_suffix, prev->multi_uri_suffix, ".urlset");
 
 	ngx_conf_merge_uint_value(conf->segmenter.segment_duration, prev->segmenter.segment_duration, 10000);
-	ngx_conf_merge_uint_value(conf->segmenter.live_segment_count, prev->segmenter.live_segment_count, 3);
+	ngx_conf_merge_value(conf->segmenter.live_segment_count, prev->segmenter.live_segment_count, 3);
 	ngx_conf_merge_ptr_value(conf->segmenter.bootstrap_segments, prev->segmenter.bootstrap_segments, NULL);
 	ngx_conf_merge_value(conf->segmenter.align_to_key_frames, prev->segmenter.align_to_key_frames, 0);
 	ngx_conf_merge_ptr_value(conf->segmenter.get_segment_count, prev->segmenter.get_segment_count, segmenter_get_segment_count_last_short);
@@ -156,16 +207,25 @@ ngx_http_vod_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 	{
 		conf->secret_key = prev->secret_key;
 	}
-	ngx_conf_merge_str_value(conf->https_header_name, prev->https_header_name, "");
-	ngx_conf_merge_str_value(conf->segments_base_url, prev->segments_base_url, "");
-	conf->segments_base_url_has_scheme =
-		(ngx_strncasecmp(conf->segments_base_url.data, (u_char *) "http://", 7) == 0 ||
-		ngx_strncasecmp(conf->segments_base_url.data, (u_char *) "https://", 8) == 0);
 
-
-	if (conf->moov_cache == NULL)
+	if (conf->base_url == NULL)
 	{
-		conf->moov_cache = prev->moov_cache;
+		conf->base_url = prev->base_url;
+	}
+
+	if (conf->segments_base_url == NULL)
+	{
+		conf->segments_base_url = prev->segments_base_url;
+	}
+
+	if (conf->metadata_cache == NULL)
+	{
+		conf->metadata_cache = prev->metadata_cache;
+	}
+
+	if (conf->dynamic_mapping_cache == NULL)
+	{
+		conf->dynamic_mapping_cache = prev->dynamic_mapping_cache;
 	}
 
 	for (cache_type = 0; cache_type < CACHE_TYPE_COUNT; cache_type++)
@@ -175,17 +235,25 @@ ngx_http_vod_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 			conf->response_cache[cache_type] = prev->response_cache[cache_type];
 		}
 
-		if (conf->path_mapping_cache[cache_type] == NULL)
+		if (conf->mapping_cache[cache_type] == NULL)
 		{
-			conf->path_mapping_cache[cache_type] = prev->path_mapping_cache[cache_type];
+			conf->mapping_cache[cache_type] = prev->mapping_cache[cache_type];
 		}
+
+		ngx_conf_merge_value(conf->expires[cache_type], prev->expires[cache_type], -1);
 	}
 
 	ngx_conf_merge_size_value(conf->initial_read_size, prev->initial_read_size, 4096);
-	ngx_conf_merge_size_value(conf->max_moov_size, prev->max_moov_size, 128 * 1024 * 1024);
+	ngx_conf_merge_size_value(conf->max_metadata_size, prev->max_metadata_size, 128 * 1024 * 1024);
+	ngx_conf_merge_size_value(conf->max_frames_size, prev->max_frames_size, 16 * 1024 * 1024);
 	ngx_conf_merge_size_value(conf->cache_buffer_size, prev->cache_buffer_size, 256 * 1024);
 	ngx_conf_merge_size_value(conf->max_upstream_headers_size, prev->max_upstream_headers_size, 4 * 1024);
 	
+	if (conf->output_buffer_pool == NULL)
+	{
+		conf->output_buffer_pool = prev->output_buffer_pool;
+	}
+
 	ngx_conf_merge_value(conf->ignore_edit_list, prev->ignore_edit_list, 0);
 
 	if (conf->upstream_extra_args == NULL)
@@ -196,6 +264,26 @@ ngx_http_vod_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 	ngx_conf_merge_str_value(conf->path_response_prefix, prev->path_response_prefix, "{\"sequences\":[{\"clips\":[{\"type\":\"source\",\"path\":\"");
 	ngx_conf_merge_str_value(conf->path_response_postfix, prev->path_response_postfix, "\"}]}]}");
 	ngx_conf_merge_size_value(conf->max_mapping_response_size, prev->max_mapping_response_size, 1024);
+	if (conf->dynamic_clip_map_uri == NULL)
+	{
+		conf->dynamic_clip_map_uri = prev->dynamic_clip_map_uri;
+	}
+	if (conf->source_clip_map_uri == NULL)
+	{
+		conf->source_clip_map_uri = prev->source_clip_map_uri;
+	}
+	if (conf->redirect_segments_url == NULL)
+	{
+		conf->redirect_segments_url = prev->redirect_segments_url;
+	}
+	if (conf->media_set_map_uri == NULL)
+	{
+		conf->media_set_map_uri = prev->media_set_map_uri;
+	}
+	if (conf->apply_dynamic_mapping == NULL)
+	{
+		conf->apply_dynamic_mapping = prev->apply_dynamic_mapping;
+	}
 
 	ngx_conf_merge_str_value(conf->fallback_upstream_location, prev->fallback_upstream_location, "");
 	ngx_conf_merge_str_value(conf->proxy_header.key, prev->proxy_header.key, "X-Kaltura-Proxy");
@@ -225,7 +313,8 @@ ngx_http_vod_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 	{
 		conf->drm_request_uri = prev->drm_request_uri;
 	}
-
+	ngx_conf_merge_uint_value(conf->min_single_nalu_per_frame_segment, prev->min_single_nalu_per_frame_segment, 0);
+	
 	ngx_conf_merge_str_value(conf->clip_to_param_name, prev->clip_to_param_name, "clipTo");
 	ngx_conf_merge_str_value(conf->clip_from_param_name, prev->clip_from_param_name, "clipFrom");
 	ngx_conf_merge_str_value(conf->tracks_param_name, prev->tracks_param_name, "tracks");
@@ -241,12 +330,12 @@ ngx_http_vod_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 #endif
 
 	// validate vod_upstream / vod_upstream_host_header used when needed
-	if (conf->request_handler == ngx_http_vod_remote_request_handler || conf->request_handler == ngx_http_vod_mapped_request_handler)
+	if (conf->request_handler == ngx_http_vod_remote_request_handler)
 	{
 		if (conf->upstream_location.len == 0)
 		{
 			ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-				"\"vod_upstream_location\" is mandatory for remote/mapped modes");
+				"\"vod_upstream_location\" is mandatory for remote mode");
 			return NGX_CONF_ERROR;
 		}
 	}
@@ -368,6 +457,47 @@ ngx_http_vod_set_time_slot(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 	if (cmd->post) {
 		post = cmd->post;
 		return post->post_handler(cf, post, sp);
+	}
+
+	return NGX_CONF_OK;
+}
+
+char *
+ngx_http_vod_set_signed_slot(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+	char  *p = conf;
+
+	ngx_int_t        *np;
+	ngx_str_t        *value;
+	ngx_conf_post_t  *post;
+
+
+	np = (ngx_int_t *)(p + cmd->offset);
+
+	if (*np != NGX_CONF_UNSET) {
+		return "is duplicate";
+	}
+
+	value = cf->args->elts;
+	if (value[1].len > 0 && value[1].data[0] == '-')
+	{
+		*np = ngx_atoi(value[1].data + 1, value[1].len - 1);
+		if (*np == NGX_ERROR) {
+			return "invalid number";
+		}
+		*np = -(*np);
+	}
+	else
+	{
+		*np = ngx_atoi(value[1].data, value[1].len);
+		if (*np == NGX_ERROR) {
+			return "invalid number";
+		}
+	}
+
+	if (cmd->post) {
+		post = cmd->post;
+		return post->post_handler(cf, post, np);
 	}
 
 	return NGX_CONF_OK;
@@ -588,6 +718,42 @@ ngx_http_vod_perf_counters_command(ngx_conf_t *cf, ngx_command_t *cmd, void *con
 	return NGX_CONF_OK;
 }
 
+static char*
+ngx_http_vod_buffer_pool_command(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+	buffer_pool_t** buffer_pool = (buffer_pool_t **)((u_char*)conf + cmd->offset);
+	ngx_str_t  *value;
+	ngx_int_t count;
+	ssize_t buffer_size;
+
+	if (*buffer_pool != NULL)
+	{
+		return "is duplicate";
+	}
+
+	value = cf->args->elts;
+
+	buffer_size = ngx_parse_size(&value[1]);
+	if (buffer_size == NGX_ERROR)
+	{
+		return "invalid size";
+	}
+
+	count = ngx_atoi(value[2].data, value[2].len);
+	if (count == NGX_ERROR)
+	{
+		return "invalid count";
+	}
+	
+	*buffer_pool = buffer_pool_create(cf->pool, cf->log, buffer_size, count);
+	if (*buffer_pool == NULL)
+	{
+		return NGX_CONF_ERROR;
+	}
+	
+	return NGX_CONF_OK;
+}
+
 static char *
 ngx_http_vod(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -708,7 +874,7 @@ ngx_command_t ngx_http_vod_commands[] = {
 
 	{ ngx_string("vod_live_segment_count"),
 	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
-	ngx_conf_set_num_slot,
+	ngx_http_vod_set_signed_slot,
 	NGX_HTTP_LOC_CONF_OFFSET,
 	offsetof(ngx_http_vod_loc_conf_t, segmenter.live_segment_count),
 	NULL },
@@ -748,26 +914,26 @@ ngx_command_t ngx_http_vod_commands[] = {
 	offsetof(ngx_http_vod_loc_conf_t, secret_key),
 	NULL },
 
-	{ ngx_string("vod_https_header_name"),
+	{ ngx_string("vod_base_url"),
 	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
-	ngx_conf_set_str_slot,
+	ngx_http_set_complex_value_slot,
 	NGX_HTTP_LOC_CONF_OFFSET,
-	offsetof(ngx_http_vod_loc_conf_t, https_header_name),
+	offsetof(ngx_http_vod_loc_conf_t, base_url),
 	NULL },
 
 	{ ngx_string("vod_segments_base_url"),
 	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
-	ngx_conf_set_str_slot,
+	ngx_http_set_complex_value_slot,
 	NGX_HTTP_LOC_CONF_OFFSET,
 	offsetof(ngx_http_vod_loc_conf_t, segments_base_url),
 	NULL },
 	
 	// mp4 reading parameters
-	{ ngx_string("vod_moov_cache"),
+	{ ngx_string("vod_metadata_cache"),
 	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE123,
 	ngx_http_vod_cache_command,
 	NGX_HTTP_LOC_CONF_OFFSET,
-	offsetof(ngx_http_vod_loc_conf_t, moov_cache),
+	offsetof(ngx_http_vod_loc_conf_t, metadata_cache),
 	NULL },
 
 	{ ngx_string("vod_response_cache"),
@@ -791,11 +957,18 @@ ngx_command_t ngx_http_vod_commands[] = {
 	offsetof(ngx_http_vod_loc_conf_t, initial_read_size),
 	NULL },
 
-	{ ngx_string("vod_max_moov_size"),
+	{ ngx_string("vod_max_metadata_size"),
 	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
 	ngx_conf_set_size_slot,
 	NGX_HTTP_LOC_CONF_OFFSET,
-	offsetof(ngx_http_vod_loc_conf_t, max_moov_size),
+	offsetof(ngx_http_vod_loc_conf_t, max_metadata_size),
+	NULL },
+
+	{ ngx_string("vod_max_frames_size"),
+	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+	ngx_conf_set_size_slot,
+	NGX_HTTP_LOC_CONF_OFFSET,
+	offsetof(ngx_http_vod_loc_conf_t, max_frames_size),
 	NULL },
 
 	{ ngx_string("vod_cache_buffer_size"),
@@ -810,6 +983,13 @@ ngx_command_t ngx_http_vod_commands[] = {
 	ngx_conf_set_flag_slot,
 	NGX_HTTP_LOC_CONF_OFFSET,
 	offsetof(ngx_http_vod_loc_conf_t, ignore_edit_list),
+	NULL },
+
+	{ ngx_string("vod_output_buffer_pool"),
+	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE2,
+	ngx_http_vod_buffer_pool_command,
+	NGX_HTTP_LOC_CONF_OFFSET,
+	offsetof(ngx_http_vod_loc_conf_t, output_buffer_pool),
 	NULL },
 
 	// upstream parameters - only for mapped/remote modes
@@ -835,18 +1015,25 @@ ngx_command_t ngx_http_vod_commands[] = {
 	NULL },
 
 	// path request parameters - mapped mode only
-	{ ngx_string("vod_path_mapping_cache"),
+	{ ngx_string("vod_mapping_cache"),
 	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE123,
 	ngx_http_vod_cache_command,
 	NGX_HTTP_LOC_CONF_OFFSET,
-	offsetof(ngx_http_vod_loc_conf_t, path_mapping_cache[CACHE_TYPE_VOD]),
+	offsetof(ngx_http_vod_loc_conf_t, mapping_cache[CACHE_TYPE_VOD]),
 	NULL },
 
-	{ ngx_string("vod_live_path_mapping_cache"),
+	{ ngx_string("vod_live_mapping_cache"),
 	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE123,
 	ngx_http_vod_cache_command,
 	NGX_HTTP_LOC_CONF_OFFSET,
-	offsetof(ngx_http_vod_loc_conf_t, path_mapping_cache[CACHE_TYPE_LIVE]),
+	offsetof(ngx_http_vod_loc_conf_t, mapping_cache[CACHE_TYPE_LIVE]),
+	NULL },
+
+	{ ngx_string("vod_dynamic_mapping_cache"),
+	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE123,
+	ngx_http_vod_cache_command,
+	NGX_HTTP_LOC_CONF_OFFSET,
+	offsetof(ngx_http_vod_loc_conf_t, dynamic_mapping_cache),
 	NULL },
 
 	{ ngx_string("vod_path_response_prefix"),
@@ -870,6 +1057,41 @@ ngx_command_t ngx_http_vod_commands[] = {
 	offsetof(ngx_http_vod_loc_conf_t, max_mapping_response_size),
 	NULL },
 
+	{ ngx_string("vod_dynamic_clip_map_uri"),
+	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+	ngx_http_set_complex_value_slot,
+	NGX_HTTP_LOC_CONF_OFFSET,
+	offsetof(ngx_http_vod_loc_conf_t, dynamic_clip_map_uri),
+	NULL },
+
+	{ ngx_string("vod_source_clip_map_uri"),
+	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+	ngx_http_set_complex_value_slot,
+	NGX_HTTP_LOC_CONF_OFFSET,
+	offsetof(ngx_http_vod_loc_conf_t, source_clip_map_uri),
+	NULL },
+
+	{ ngx_string("vod_redirect_segments_url"),
+	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+	ngx_http_set_complex_value_slot,
+	NGX_HTTP_LOC_CONF_OFFSET,
+	offsetof(ngx_http_vod_loc_conf_t, redirect_segments_url),
+	NULL },
+
+	{ ngx_string("vod_media_set_map_uri"),
+	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+	ngx_http_set_complex_value_slot,
+	NGX_HTTP_LOC_CONF_OFFSET,
+	offsetof(ngx_http_vod_loc_conf_t, media_set_map_uri),
+	NULL },
+
+	{ ngx_string("vod_apply_dynamic_mapping"),
+	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+	ngx_http_set_complex_value_slot,
+	NGX_HTTP_LOC_CONF_OFFSET,
+	offsetof(ngx_http_vod_loc_conf_t, apply_dynamic_mapping),
+	NULL },
+
 	// fallback upstream - only for local/mapped modes
 	{ ngx_string("vod_fallback_upstream_location"),
 	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
@@ -890,6 +1112,21 @@ ngx_command_t ngx_http_vod_commands[] = {
 	ngx_conf_set_str_slot,
 	NGX_HTTP_LOC_CONF_OFFSET,
 	offsetof(ngx_http_vod_loc_conf_t, proxy_header.value),
+	NULL },
+
+	// expires
+	{ ngx_string("vod_expires"),
+	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+	ngx_conf_set_sec_slot,
+	NGX_HTTP_LOC_CONF_OFFSET,
+	offsetof(ngx_http_vod_loc_conf_t, expires[CACHE_TYPE_VOD]),
+	NULL },
+
+	{ ngx_string("vod_expires_live"),
+	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+	ngx_conf_set_sec_slot,
+	NGX_HTTP_LOC_CONF_OFFSET,
+	offsetof(ngx_http_vod_loc_conf_t, expires[CACHE_TYPE_LIVE]),
 	NULL },
 
 	// last modified
@@ -949,6 +1186,13 @@ ngx_command_t ngx_http_vod_commands[] = {
 	ngx_http_set_complex_value_slot,
 	NGX_HTTP_LOC_CONF_OFFSET,
 	offsetof(ngx_http_vod_loc_conf_t, drm_request_uri),
+	NULL },
+
+	{ ngx_string("vod_min_single_nalu_per_frame_segment"),
+	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+	ngx_conf_set_num_slot,
+	NGX_HTTP_LOC_CONF_OFFSET,
+	offsetof(ngx_http_vod_loc_conf_t, min_single_nalu_per_frame_segment),
 	NULL },
 #endif //(NGX_HAVE_OPENSSL_EVP)
 

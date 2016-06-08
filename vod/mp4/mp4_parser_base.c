@@ -55,8 +55,11 @@ mp4_parser_parse_atoms(
 		
 		if (atom_size < atom_info.header_size)
 		{
-			vod_log_error(VOD_LOG_ERR, request_context->log, 0,
-				"mp4_parser_parse_atoms: atom size %uL is less than the atom header size %ud", atom_size, atom_info.header_size);
+			if (validate_full_atom)
+			{
+				vod_log_error(VOD_LOG_ERR, request_context->log, 0,
+					"mp4_parser_parse_atoms: atom size %uL is less than the atom header size %ud", atom_size, atom_info.header_size);
+			}
 			return VOD_BAD_DATA;
 		}
 		
@@ -326,6 +329,8 @@ mp4_parser_validate_stsz_atom(
 					"mp4_parser_validate_stsz_atom: uniform size %uD is too big", *uniform_size);
 				return VOD_BAD_DATA;
 			}
+
+			*entries = parse_be32(atom->entries);
 
 			return VOD_OK;
 		}

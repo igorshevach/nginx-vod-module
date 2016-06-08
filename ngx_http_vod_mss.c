@@ -1,9 +1,12 @@
 #include <ngx_http.h>
 #include "ngx_http_vod_submodule.h"
 #include "ngx_http_vod_utils.h"
-#include "ngx_http_vod_udrm.h"
 #include "vod/mss/mss_packager.h"
 #include "vod/mss/mss_playready.h"
+#include "vod/udrm.h"
+
+// constants
+#define SUPPORTED_CODECS (VOD_CODEC_FLAG(AVC) | VOD_CODEC_FLAG(AAC) | VOD_CODEC_FLAG(MP3))
 
 // typedefs
 typedef struct {
@@ -27,6 +30,9 @@ static const ngx_http_vod_match_definition_t fragment_match_definition[] = {
 static u_char mp4_audio_content_type[] = "audio/mp4";
 static u_char mp4_video_content_type[] = "video/mp4";
 static u_char manifest_content_type[] = "text/xml";		// TODO: consider moving to application/vnd.ms-sstr+xml
+
+// extensions
+static const u_char m4s_file_ext[] = ".m4s";
 
 static ngx_int_t 
 ngx_http_vod_mss_handle_manifest(
@@ -79,19 +85,21 @@ ngx_http_vod_mss_init_frame_processor(
 	size_t* response_size,
 	ngx_str_t* content_type)
 {
+	ngx_http_vod_loc_conf_t* conf = submodule_context->conf;
 	fragment_writer_state_t* state;
 	segment_writer_t drm_writer;
 	vod_status_t rc;
 	bool_t reuse_buffers = FALSE;
 	bool_t size_only = ngx_http_vod_submodule_size_only(submodule_context);
 
-	if (submodule_context->conf->drm_enabled)
+	if (conf->drm_enabled)
 	{
 		rc = mss_playready_get_fragment_writer(
 			&drm_writer,
 			&submodule_context->request_context,
 			&submodule_context->media_set,
 			submodule_context->request_params.segment_index,
+			conf->min_single_nalu_per_frame_segment > 0 && submodule_context->request_params.segment_index >= conf->min_single_nalu_per_frame_segment - 1,
 			segment_writer,
 			submodule_context->media_set.sequences[0].encryption_key,		// iv
 			size_only,
@@ -169,6 +177,8 @@ static const ngx_http_vod_request_t mss_manifest_request = {
 	REQUEST_FLAG_TIME_DEPENDENT_ON_LIVE,
 	PARSE_FLAG_TOTAL_SIZE_ESTIMATE | PARSE_FLAG_PARSED_EXTRA_DATA,
 	REQUEST_CLASS_MANIFEST,
+	SUPPORTED_CODECS,
+	MSS_TIMESCALE,
 	ngx_http_vod_mss_handle_manifest,
 	NULL,
 };
@@ -177,6 +187,8 @@ static const ngx_http_vod_request_t mss_fragment_request = {
 	REQUEST_FLAG_SINGLE_TRACK,
 	PARSE_FLAG_FRAMES_ALL,
 	REQUEST_CLASS_SEGMENT,
+	SUPPORTED_CODECS,
+	MSS_TIMESCALE,
 	NULL,
 	ngx_http_vod_mss_init_frame_processor,
 };
@@ -185,6 +197,8 @@ static const ngx_http_vod_request_t mss_playready_fragment_request = {
 	REQUEST_FLAG_SINGLE_TRACK,
 	PARSE_FLAG_FRAMES_ALL | PARSE_FLAG_PARSED_EXTRA_DATA,
 	REQUEST_CLASS_SEGMENT,
+	SUPPORTED_CODECS,
+	MSS_TIMESCALE,
 	NULL,
 	ngx_http_vod_mss_init_frame_processor,
 };
@@ -276,33 +290,43 @@ ngx_http_vod_mss_parse_uri_file_name(
 		// Note: assuming no discontinuity, if this changes the segment index will be recalculated
 		request_params->segment_index = segmenter_get_segment_index_no_discontinuity(
 			&conf->segmenter, 
-			request_params->segment_time);
+			request_params->segment_time + SEGMENT_FROM_TIMESTAMP_MARGIN);
 
 		*request = conf->drm_enabled ? &mss_playready_fragment_request : &mss_fragment_request;
 
 		return NGX_OK;
 	}
-
 	// manifest
-	if (!ngx_http_vod_starts_with(start_pos, end_pos, &conf->mss.manifest_file_name_prefix))
+	else if (ngx_http_vod_starts_with(start_pos, end_pos, &conf->mss.manifest_file_name_prefix))
+	{
+		*request = &mss_manifest_request;
+		start_pos += conf->mss.manifest_file_name_prefix.len;
+
+		rc = ngx_http_vod_parse_uri_file_name(r, start_pos, end_pos, PARSE_FILE_NAME_MULTI_STREAMS_PER_TYPE, request_params);
+		if (rc != NGX_OK)
+		{
+			ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+				"ngx_http_vod_mss_parse_uri_file_name: ngx_http_vod_parse_uri_file_name failed %i", rc);
+			return rc;
+		}
+
+		return NGX_OK;
+	}
+	// fragment with non-standard format (used with redirect)
+	else if (ngx_http_vod_match_prefix_postfix(start_pos, end_pos, &conf->hls.m3u8_config.segment_file_name_prefix, m4s_file_ext))
+	{
+		start_pos += conf->hls.m3u8_config.segment_file_name_prefix.len;
+		end_pos -= (sizeof(m4s_file_ext) - 1);
+		*request = conf->drm_enabled ? &mss_playready_fragment_request : &mss_fragment_request;
+
+		return ngx_http_vod_parse_uri_file_name(r, start_pos, end_pos, PARSE_FILE_NAME_EXPECT_SEGMENT_INDEX, request_params);
+	}
+	else
 	{
 		ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
 			"ngx_http_vod_mss_parse_uri_file_name: unidentified request");
 		return NGX_HTTP_BAD_REQUEST;
 	}
-
-	*request = &mss_manifest_request;
-	start_pos += conf->mss.manifest_file_name_prefix.len;
-
-	rc = ngx_http_vod_parse_uri_file_name(r, start_pos, end_pos, FALSE, request_params);
-	if (rc != NGX_OK)
-	{
-		ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-			"ngx_http_vod_mss_parse_uri_file_name: ngx_http_vod_parse_uri_file_name failed %i", rc);
-		return rc;
-	}
-
-	return NGX_OK;
 }
 
 ngx_int_t
@@ -311,10 +335,19 @@ ngx_http_vod_mss_parse_drm_info(
 	ngx_str_t* drm_info,
 	void** output)
 {
-	return 	ngx_http_vod_udrm_parse_response(
+	vod_status_t rc;
+	
+	rc = udrm_parse_response(
 		&submodule_context->request_context,
 		drm_info,
+		TRUE,
 		output);
+	if (rc != VOD_OK)
+	{
+		return NGX_ERROR;
+	}
+
+	return NGX_OK;
 }
 
 DEFINE_SUBMODULE(mss);

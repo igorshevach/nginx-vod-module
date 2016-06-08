@@ -3,7 +3,7 @@
 
 // includes
 #include "mp4/mp4_aes_ctr.h"
-#include "mp4/mp4_parser.h"
+#include "media_format.h"
 #include "media_clip.h"
 #include "json_parser.h"
 
@@ -38,15 +38,20 @@ typedef struct {
 typedef struct {
 	media_track_t* first_track;
 	media_track_t* last_track;
-	raw_atom_t mvhd_atom;
 	media_track_t* longest_track[MEDIA_TYPE_COUNT];
 } media_clip_filtered_t;
 
 struct media_sequence_s {
 	// initialized during parsing
 	uint32_t index;
+	vod_array_part_t* unparsed_clips;
 	media_clip_t** clips;						// [clip_count]
 	vod_str_t stripped_uri;
+	vod_str_t id;
+	vod_str_t label;
+	language_id_t language;
+	int64_t first_key_frame_offset;
+	vod_array_part_t* key_frame_durations;
 
 	// initialized after mapping
 	vod_str_t mapped_uri;
@@ -60,7 +65,7 @@ struct media_sequence_s {
 	uint32_t track_count[MEDIA_TYPE_COUNT];		// track count in each filtered_clips
 	uint32_t total_track_count;
 	int media_type;
-	media_clip_filtered_t* filtered_clips;		// [clip_count]
+	media_clip_filtered_t* filtered_clips;		// [clip_count]		// XXXXX reduce usage, use filtered_tracks instead
 	media_clip_filtered_t* filtered_clips_end;
 
 	uint64_t total_frame_size;
@@ -79,8 +84,9 @@ typedef struct {
 	media_sequence_t* sequences;			// [sequence_count]
 	media_sequence_t* sequences_end;
 	bool_t has_multi_sequences;
-	media_clip_source_t** sources;
-	media_clip_source_t** sources_end;
+	media_clip_source_t* sources_head;
+	media_clip_source_t* mapped_sources_head;
+	struct media_clip_dynamic_s* dynamic_clips_head;
 	bool_t use_discontinuity;
 	uint32_t initial_segment_index;			// the index of the first segment in the playlist
 	uint32_t initial_clip_segment_index;	// the index of the first segment of the first playlist clip (can be less than initial_segment_index when the beginning of the clip is outside the live window)
@@ -88,6 +94,7 @@ typedef struct {
 	uint64_t first_clip_time;
 	uint64_t segment_start_time;
 	uint32_t type;
+	bool_t presentation_end;
 	vod_str_t uri;
 
 	// initialized while applying filters
@@ -101,9 +108,14 @@ typedef struct {
 typedef struct {
 	uint64_t segment_time;		// used in mss
 	uint32_t segment_index;
+    uint32_t segment_duration_millis; // debug
+    uint64_t segment_start_time_millis;  // debug
 	uint32_t clip_index;
 	uint32_t sequences_mask;
+	vod_str_t sequence_id;
 	uint32_t tracks_mask[MEDIA_TYPE_COUNT];
+	uint32_t* sequence_tracks_mask;	// [MAX_SEQUENCES][MEDIA_TYPE_COUNT]
+	uint8_t* langs_mask;			// [LANG_MASK_SIZE]
 } request_params_t;
 
 #endif //__MEDIA_SET_H__

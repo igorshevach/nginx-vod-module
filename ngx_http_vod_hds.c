@@ -3,6 +3,10 @@
 #include "ngx_http_vod_utils.h"
 #include "vod/hds/hds_manifest.h"
 #include "vod/hds/hds_fragment.h"
+#include "vod/udrm.h"
+
+// constants
+#define SUPPORTED_CODECS (VOD_CODEC_FLAG(AVC) | VOD_CODEC_FLAG(AAC) | VOD_CODEC_FLAG(MP3))
 
 // content types
 static u_char f4m_content_type[] = "video/f4m";
@@ -26,6 +30,7 @@ ngx_http_vod_hds_handle_manifest(
 		&submodule_context->conf->hds.manifest_config,
 		&submodule_context->r->uri,
 		&submodule_context->media_set,
+		submodule_context->conf->drm_enabled,
 		response);
 	if (rc != VOD_OK)
 	{
@@ -76,13 +81,29 @@ ngx_http_vod_hds_init_frame_processor(
 	ngx_str_t* content_type)
 {
 	hds_muxer_state_t* state;
-	vod_status_t rc;	
-	
+	hds_encryption_params_t encryption_params;
+	vod_status_t rc;
+	drm_info_t* drm_info;
+
+	if (submodule_context->conf->drm_enabled)
+	{
+		drm_info = submodule_context->media_set.sequences[0].drm_info;
+
+		encryption_params.type = HDS_ENC_SELECTIVE;
+		encryption_params.key = drm_info->key;
+		encryption_params.iv = submodule_context->media_set.sequences[0].encryption_key;
+	}
+	else
+	{
+		encryption_params.type = HDS_ENC_NONE;
+	}
+
 	rc = hds_muxer_init_fragment(
 		&submodule_context->request_context,
 		&submodule_context->conf->hds.fragment_config,
+		&encryption_params,
 		submodule_context->request_params.segment_index,
-		submodule_context->media_set.sequences,
+		&submodule_context->media_set,
 		segment_writer->write_tail,
 		segment_writer->context,
 		ngx_http_vod_submodule_size_only(submodule_context),
@@ -110,6 +131,8 @@ static const ngx_http_vod_request_t hds_manifest_request = {
 	0,
 	PARSE_FLAG_DURATION_LIMITS_AND_TOTAL_SIZE,
 	REQUEST_CLASS_MANIFEST,
+	SUPPORTED_CODECS,
+	HDS_TIMESCALE,
 	ngx_http_vod_hds_handle_manifest,
 	NULL,
 };
@@ -118,6 +141,8 @@ static const ngx_http_vod_request_t hds_bootstrap_request = {
 	REQUEST_FLAG_SINGLE_TRACK_PER_MEDIA_TYPE | REQUEST_FLAG_TIME_DEPENDENT_ON_LIVE,
 	0,
 	REQUEST_CLASS_MANIFEST,
+	SUPPORTED_CODECS,
+	HDS_TIMESCALE,
 	ngx_http_vod_hds_handle_bootstrap,
 	NULL,
 };
@@ -126,6 +151,8 @@ static const ngx_http_vod_request_t hds_fragment_request = {
 	REQUEST_FLAG_SINGLE_TRACK_PER_MEDIA_TYPE,
 	PARSE_FLAG_FRAMES_ALL | PARSE_FLAG_EXTRA_DATA,
 	REQUEST_CLASS_SEGMENT,
+	SUPPORTED_CODECS,
+	HDS_TIMESCALE,
 	NULL,
 	ngx_http_vod_hds_init_frame_processor,
 };
@@ -168,6 +195,7 @@ ngx_http_vod_hds_parse_uri_file_name(
 	request_params_t* request_params,
 	const ngx_http_vod_request_t** request)
 {
+	uint32_t flags = 0;
 	ngx_int_t rc;
 
 	// fragment request
@@ -212,6 +240,7 @@ ngx_http_vod_hds_parse_uri_file_name(
 		start_pos += conf->hds.manifest_file_name_prefix.len;
 		end_pos -= (sizeof(manifest_file_ext) - 1);
 		*request = &hds_manifest_request;
+		flags = PARSE_FILE_NAME_MULTI_STREAMS_PER_TYPE;
 	}
 	else
 	{
@@ -221,7 +250,7 @@ ngx_http_vod_hds_parse_uri_file_name(
 	}
 
 	// parse the required tracks string
-	rc = ngx_http_vod_parse_uri_file_name(r, start_pos, end_pos, FALSE, request_params);
+	rc = ngx_http_vod_parse_uri_file_name(r, start_pos, end_pos, flags, request_params);
 	if (rc != NGX_OK)
 	{
 		ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -238,9 +267,29 @@ ngx_http_vod_hds_parse_drm_info(
 	ngx_str_t* drm_info,
 	void** output)
 {
-	ngx_log_error(NGX_LOG_ERR, submodule_context->request_context.log, 0,
-		"ngx_http_vod_hds_parse_drm_info: drm support for hds not implemented");
-	return VOD_UNEXPECTED;
+	drm_info_t* result;
+	ngx_int_t rc;
+	
+	rc = udrm_parse_response(
+		&submodule_context->request_context,
+		drm_info,
+		FALSE,
+		(void**)&result);
+	if (rc != VOD_OK)
+	{
+		return NGX_ERROR;
+	}
+
+	if (result->pssh_array.count != 1)
+	{
+		ngx_log_error(NGX_LOG_ERR, submodule_context->request_context.log, 0,
+			"ngx_http_vod_hds_parse_drm_info: pssh array must contain a single element");
+		return NGX_ERROR;
+	}
+
+	*output = result;
+
+	return NGX_OK;
 }
 
 DEFINE_SUBMODULE(hds);

@@ -7,8 +7,11 @@
 #include "mpegts_encoder_filter.h"
 #include "buffer_filter.h"
 #include "aes_cbc_encrypt.h"
-#include "../mp4/mp4_parser.h"
+#include "../media_format.h"
 #include "../segmenter.h"
+
+// constants
+#define HLS_TIMESCALE (90000)
 
 // typedefs
 typedef void(*hls_get_iframe_positions_callback_t)(
@@ -21,24 +24,21 @@ typedef void(*hls_get_iframe_positions_callback_t)(
 typedef struct {
 	bool_t interleave_frames;
 	bool_t align_frames;
+	bool_t output_id3_timestamps;
 } hls_muxer_conf_t;
 
 typedef struct {
 	int media_type;
-	uint32_t timescale;
-	frames_source_t* frames_source;
-	void* frames_source_context;
 	
 	// input frames
-	input_frame_t* first_frame;
+	frame_list_part_t* first_frame_part;
+	frame_list_part_t cur_frame_part;
 	input_frame_t* cur_frame;
-	input_frame_t* last_frame;
+	media_clip_source_t* source;
 
 	// time offsets
-	uint64_t clip_start_time;
 	uint64_t first_frame_time_offset;
 	uint64_t next_frame_time_offset;
-	uint64_t next_frame_dts;
 	int32_t clip_from_frame_offset;
 
 	// iframes simulation only
@@ -47,10 +47,6 @@ typedef struct {
 	uint32_t prev_key_frame;
 	uint64_t prev_frame_pts;
 
-	// frame offsets
-	uint64_t* first_frame_offset;
-	uint64_t* cur_frame_offset;
-		
 	// top filter
 	const media_filter_t* top_filter;
 	void* top_filter_context;
@@ -74,10 +70,9 @@ typedef struct {
 	write_buffer_queue_t queue;
 	aes_cbc_encrypt_context_t* encrypted_write_context;
 	
-	// cur sequence state
-	media_clip_filtered_t* clips_start;
-	media_clip_filtered_t* clips_end;
-	media_clip_filtered_t* cur_clip;
+	// cur clip state
+	media_set_t* media_set;
+	media_track_t* first_clip_track;
 	bool_t use_discontinuity;
 
 	// cur frame state
@@ -92,8 +87,7 @@ typedef struct {
 } hls_muxer_state_t;
 
 // functions
-vod_status_t hls_muxer_init(
-	hls_muxer_state_t* state,
+vod_status_t hls_muxer_init_segment(
 	request_context_t* request_context,
 	hls_muxer_conf_t* conf,
 	hls_encryption_params_t* encryption_params,
@@ -101,19 +95,19 @@ vod_status_t hls_muxer_init(
 	media_set_t* media_set,
 	write_callback_t write_callback,
 	void* write_context,
-	bool_t* simulation_supported);
+	size_t* response_size,
+	vod_str_t* response_header,
+	hls_muxer_state_t** processor_state);
 
 vod_status_t hls_muxer_process(hls_muxer_state_t* state);
 
 vod_status_t hls_muxer_simulate_get_iframes(
-	hls_muxer_state_t* state,
+	request_context_t* request_context,
 	segment_durations_t* segment_durations,
+	hls_muxer_conf_t* muxer_conf,
+	hls_encryption_params_t* encryption_params,
 	media_set_t* media_set,
 	hls_get_iframe_positions_callback_t callback,
 	void* context);
-
-vod_status_t hls_muxer_simulate_get_segment_size(hls_muxer_state_t* state, size_t* result);
-
-void hls_muxer_simulation_reset(hls_muxer_state_t* state);
 
 #endif // __HLS_MUXER_H__

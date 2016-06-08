@@ -5,6 +5,7 @@
 #include "mp4_aes_ctr.h"
 #include "mp4_parser.h"
 #include "../read_stream.h"
+#include "../buffer_pool.h"
 
 // constants
 #define BUFFER_SIZE (65536)
@@ -91,12 +92,12 @@ mp4_decrypt_set_cache_slot_id(void* ctx, int cache_slot_id)
 }
 
 static vod_status_t
-mp4_decrypt_start_frame(void* ctx, input_frame_t* frame, uint64_t frame_offset)
+mp4_decrypt_start_frame(void* ctx, input_frame_t* frame, uint64_t min_offset)
 {
 	mp4_decrypt_state_t* state = ctx;
 	vod_status_t rc;
 
-	rc = state->frames_source->start_frame(state->frames_source_context, frame, frame_offset);
+	rc = state->frames_source->start_frame(state->frames_source_context, frame, min_offset);
 	if (rc != VOD_OK)
 	{
 		return rc;
@@ -214,20 +215,25 @@ mp4_decrypt_read(void* ctx, u_char** buffer, uint32_t* size, bool_t* frame_done)
 	mp4_decrypt_state_t* state = ctx;
 	vod_status_t rc;
 	uint32_t cur_size;
+	size_t buffer_size;
 
 	// make sure there is some output space
 	if (state->output_pos + MIN_BUFFER_SIZE >= state->output_end)
 	{
 		if (!state->reuse_buffers || state->output_start == NULL)
 		{
-			state->output_start = vod_alloc(state->request_context->pool, BUFFER_SIZE);
+			buffer_size = BUFFER_SIZE;
+			state->output_start = buffer_pool_alloc(
+				state->request_context, 
+				state->request_context->output_buffer_pool, 
+				&buffer_size);
 			if (state->output_start == NULL)
 			{
 				vod_log_debug0(VOD_LOG_DEBUG_LEVEL, state->request_context->log, 0,
 					"mp4_decrypt_read: vod_alloc failed");
 				return VOD_ALLOC_FAILED;
 			}
-			state->output_end = state->output_start + BUFFER_SIZE;
+			state->output_end = state->output_start + buffer_size;
 		}
 
 		state->output_pos = state->output_start;

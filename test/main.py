@@ -10,7 +10,7 @@ import random
 import time
 import os
 
-# note: debug logs must be enabled as well as moov cache
+# note: debug logs must be enabled as well as metadata cache
 
 # environment specific parameters
 from main_params import *
@@ -495,7 +495,7 @@ class DashTestSuite(ProtocolTestSuite):
 
     def testBadFragmentIndex(self):
         assertRequestFails(self.getUrl('/fragment-x-a1-x1.m4s'), 400)
-        self.logTracker.assertContains('ngx_http_vod_extract_uint32_token failed')
+        self.logTracker.assertContains('failed to parse segment index')
 
     def testBadStreamTypeFragment(self):
         assertRequestFails(self.getUrl('/fragment-1-a1-x1.m4s'), 400)
@@ -549,7 +549,7 @@ class HlsTestSuite(ProtocolTestSuite):
     # bad requests
     def testBadSegmentIndex(self):
         assertRequestFails(self.getUrl('/seg-abc-a1-v1.ts'), 400)
-        self.logTracker.assertContains('ngx_http_vod_extract_uint32_token failed')
+        self.logTracker.assertContains('failed to parse segment index')
     
     def testBadStreamIndex(self):
         assertRequestFails(self.getUrl('/seg-1-aabc-v1.ts'), 400)
@@ -855,6 +855,13 @@ class MemoryUpstreamTestSuite(UpstreamTestSuite):
         response = urllib2.urlopen(request)
         self.validateResponse(response.read(), url)
 
+    def testHideHeadersNotForwardedToUpstream(self):
+        TcpServer(self.serverPort, lambda s: socketExpectHttpHeaderAndHandle(s, None, 'if-range', self.upstreamHandler))
+        url = getUniqueUrl(self.baseUrl, self.urlFile)
+        request = urllib2.Request(url, headers={'if-range':'ukk'})
+        response = urllib2.urlopen(request)
+        self.validateResponse(response.read(), url)
+        
     def testUpstreamHostHeader(self):
         TcpServer(self.serverPort, lambda s: socketExpectHttpHeaderAndHandle(s, 'Host: blabla.com', None, self.upstreamHandler))
         url = getUniqueUrl(self.baseUrl, self.urlFile)
@@ -901,6 +908,13 @@ class DumpUpstreamTestSuite(UpstreamTestSuite):
         TcpServer(self.serverPort, lambda s: socketSendAndShutdown(s, getHttpResponse('blabla', status='402 Payment Required')))
         assertRequestFails(getUniqueUrl(self.baseUrl, self.urlFile), 402, 'blabla')
 
+    def testHideHeadersForwardedToUpstream(self):
+        handler = lambda s, headers: socketSendAndShutdown(s, getHttpResponse('abcde'))
+        TcpServer(self.serverPort, lambda s: socketExpectHttpHeaderAndHandle(s, 'if-range: ukk', None, handler))
+        url = getUniqueUrl(self.baseUrl, self.urlFile)
+        request = urllib2.Request(url, headers={'if-range':'ukk'})
+        assertEquals(urllib2.urlopen(request).read(), 'abcde')
+        
 class FallbackUpstreamTestSuite(DumpUpstreamTestSuite):
     def testLoopPreventionHeaderSent(self):
         TcpServer(self.serverPort, lambda s: socketExpectHttpHeaderAndSend(s, 'X-Kaltura-Proxy: dumpApiRequest', getHttpResponse('abcde')))
@@ -924,18 +938,18 @@ class FileServeTestSuite(TestSuite):
         assertRequestFails(self.getServeUrl(HLS_PREFIX, TEST_FOLDER) + HLS_PLAYLIST_FILE, 403)
         self.logTracker.assertContains('"%s" is not a file' % (TEST_FILES_ROOT + TEST_FOLDER))
 
-    def testMoovAtomCache(self):
+    def testMetadataCache(self):
         for curPrefix, curRequest, _ in VOD_REQUESTS:
             linkPath = createRandomSymLink(TEST_FILES_ROOT + TEST_FLAVOR_FILE)
             url = self.getServeUrl(curPrefix, linkPath) + curRequest
 
             logTracker = LogTracker()
             uncachedResponse = urllib2.urlopen(url).read()
-            logTracker.assertContains('moov atom cache miss')
+            logTracker.assertContains('metadata cache miss')
             
             logTracker = LogTracker()
             cachedResponse = urllib2.urlopen(url).read()
-            logTracker.assertContains(['moov atom cache hit', 'response cache hit'])
+            logTracker.assertContains(['metadata cache hit', 'response cache hit'])
 
             assert(cachedResponse == uncachedResponse)
 
@@ -1011,7 +1025,7 @@ class MappedTestSuite(ModeTestSuite):
     def testEmptyPathMappingResponse(self):
         TcpServer(API_SERVER_PORT, lambda s: socketSendAndShutdown(s, getHttpResponse('')))
         assertRequestFails(self.getUrl(HLS_PREFIX, HLS_PLAYLIST_FILE), 404)
-        self.logTracker.assertContains('empty path mapping response')
+        self.logTracker.assertContains('empty mapping response')
 
     def testUnexpectedPathResponse(self):
         TcpServer(API_SERVER_PORT, lambda s: socketSendAndShutdown(s, getHttpResponse('abcde')))
@@ -1038,14 +1052,14 @@ class MappedTestSuite(ModeTestSuite):
             response = urllib2.urlopen(url)            
             assertEquals(response.info().getheader('Content-Type'), contentType)            
             uncachedResponse = response.read()
-            logTracker.assertContains('path mapping cache miss')
+            logTracker.assertContains('mapping cache miss')
 
             #cached
             logTracker = LogTracker()
             response = urllib2.urlopen(url)
             assertEquals(response.info().getheader('Content-Type'), contentType)            
             cachedResponse = response.read()
-            logTracker.assertContains(['path mapping cache hit', 'response cache hit'])
+            logTracker.assertContains(['mapping cache hit', 'response cache hit'])
 
             assert(cachedResponse == uncachedResponse)
                    
@@ -1058,23 +1072,23 @@ class RemoteTestSuite(ModeTestSuite):
         MemoryUpstreamTestSuite(self.baseUrl + HLS_PREFIX + TEST_FLAVOR_URI, HLS_PLAYLIST_FILE, API_SERVER_PORT, requestHandler).run()
         DumpUpstreamTestSuite(self.getBaseUrl('') + TEST_FLAVOR_URI, '', API_SERVER_PORT).run()      # non HLS URL will just dump to upstream
         
-    def testMoovAtomCache(self):
+    def testMetadataCache(self):
         TcpServer(API_SERVER_PORT, lambda s: serveFile(s, TEST_FILES_ROOT + TEST_FLAVOR_FILE, TEST_FILE_TYPE))
         for curPrefix, curRequest, _ in VOD_REQUESTS:
             url = self.getUrl(curPrefix, curRequest)
 
             logTracker = LogTracker()
             uncachedResponse = urllib2.urlopen(url).read()
-            logTracker.assertContains('moov atom cache miss')
+            logTracker.assertContains('metadata cache miss')
             
             logTracker = LogTracker()
             cachedResponse = urllib2.urlopen(url).read()
-            logTracker.assertContains(['moov atom cache hit', 'response cache hit'])
+            logTracker.assertContains(['metadata cache hit', 'response cache hit'])
 
             assert(cachedResponse == uncachedResponse)
 
     def testErrorWhileProcessingFrames(self):
-        # get the moov atom into cache
+        # get the metadata into cache
         TcpServer(API_SERVER_PORT, lambda s: serveFile(s, TEST_FILES_ROOT + TEST_FLAVOR_FILE, TEST_FILE_TYPE))
         url = self.getUrl(HLS_PREFIX, HLS_SEGMENT_FILE)
         urllib2.urlopen(url).read()

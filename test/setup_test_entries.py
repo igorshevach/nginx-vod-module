@@ -191,10 +191,6 @@ TEST_CASES = [
         ('/hls', 'index.m3u8', 200, None),
         ('', 'clipTo/10000/a.mp4', 200, None),
     ]),
-    ('NON_AAC_AUDIO', lambda: convertWithFfmpeg('-vcodec copy -codec:a libmp3lame'), [
-        ('/hls', 'index.m3u8', 200, 'unsupported format - media type 1'),
-        ('', 'clipTo/10000/a.mp4', 200, None),
-    ]),
     ('NON_H264_VIDEO', lambda: convertWithFfmpeg('-acodec copy -c:v mpeg4'), [
         ('/hls', 'index.m3u8', 200, 'unsupported format - media type 0'),
         ('', 'clipTo/10000/a.mp4', 200, None),
@@ -204,8 +200,8 @@ TEST_CASES = [
         ('', 'clipTo/10000/a.mp4', 200, 'ftyp atom not found'),
     ]),
     ('CANT_FIND_MOOV', lambda: applyPatch(getAtomPos('moov') + 4, 'blah'), [
-        ('/hls', 'index.m3u8', 404, ' is smaller than the atom start offset '),
-        ('', 'clipTo/10000/a.mp4', 404, ' is smaller than the atom start offset '),
+        ('/hls', 'index.m3u8', 404, 'failed to parse any atoms'),
+        ('', 'clipTo/10000/a.mp4', 404, 'failed to parse any atoms'),
     ]),
     ('MOOV_TOO_BIG', lambda: applyPatch(getAtomPos('moov'), struct.pack('>L', 500000000)), [
         ('/hls', 'index.m3u8', 404, 'moov size 499999992 exceeds the max'),
@@ -223,21 +219,25 @@ TEST_CASES = [
         ('/hls', 'seg-1.ts', 404, 'no extra data was parsed for track'),
         ('', 'clipTo/10000/a.mp4', 200, None),
     ]),
-    ('MOOV_READ_ATTEMPTS', lambda: StringReader((struct.pack('>L', 0x1008) + 'blah' + '\0' * 0x1000) * 5), [
+    ('UNRECOGNIZED_FORMAT', lambda: StringReader('x' * 0x5000), [
+        ('/hls', 'seg-1.ts', 404, 'failed to identify the file format'),
+        ('', 'clipTo/10000/a.mp4', 404, 'failed to identify the file format'),
+    ]),
+    ('MOOV_READ_ATTEMPTS', lambda: StringReader((struct.pack('>L', 0x1008) + 'mdat' + '\0' * 0x1000) * 5), [
         ('/hls', 'seg-1.ts', 404, 'exhausted all moov read attempts'),
         ('', 'clipTo/10000/a.mp4', 404, 'exhausted all moov read attempts'),
     ]),
-    ('NO_ATOM_PARSED', lambda: StringReader(struct.pack('>L', 7) + 'moov'), [
-        ('/hls', 'seg-1.ts', 404, 'failed to parse any atoms'),
-        ('', 'clipTo/10000/a.mp4', 404, 'failed to parse any atoms'),
+    ('NO_ATOM_PARSED', lambda: StringReader(struct.pack('>L', 8) + 'ftyp' + struct.pack('>L', 7) + 'moov'), [
+        ('/hls', 'seg-1.ts', 404, 'is smaller than the buffer size'),
+        ('', 'clipTo/10000/a.mp4', 404, 'is smaller than the buffer size'),
     ]),
     
     # atom parsing
-    ('MISSING_64BIT_ATOM_SIZE', lambda: StringReader(struct.pack('>L', 1) + 'moov' + ('\0' * 7)), [
-        ('/hls', 'index.m3u8', 404, 'failed to parse any atoms'),
-        ('', 'clipTo/10000/a.mp4', 404, 'failed to parse any atoms'),
+    ('MISSING_64BIT_ATOM_SIZE', lambda: StringReader(struct.pack('>L', 8) + 'ftyp' + struct.pack('>L', 1) + 'moov' + ('\0' * 7)), [
+        ('/hls', 'index.m3u8', 404, 'is smaller than the buffer size'),
+        ('', 'clipTo/10000/a.mp4', 404, 'is smaller than the buffer size'),
     ]),
-    ('ATOM_SIZE_LESS_THAN_HEADER', lambda: StringReader(struct.pack('>L', 7) + 'moov'), [
+    ('ATOM_SIZE_LESS_THAN_HEADER', lambda: StringReader(struct.pack('>L', 8) + 'ftyp' + struct.pack('>L', 16) + 'moov' + struct.pack('>L', 7) + 'trak'), [
         ('/hls', 'index.m3u8', 404, 'atom size 7 is less than the atom header size'),
         ('', 'clipTo/10000/a.mp4', 404, 'atom size 7 is less than the atom header size'),
     ]),
@@ -312,7 +312,7 @@ TEST_CASES = [
         ('', 'clipTo/10000/a.mp4', 404, 'too small to hold 100000000 entries'),
     ]),
     ('STSC_ZERO_CHUNK_INDEX', lambda: applyPatch(getAtomDataPos('moov.trak.mdia.minf.stbl.stsc') + 8, struct.pack('>L', 0)), [
-        ('/hls', 'seg-1.ts', 404, 'chunk index is zero'),
+        ('/hls', 'seg-1.ts', 404, 'first chunk index is not 1'),
         ('', 'clipTo/10000/a.mp4', 404, 'chunk index is zero'),
     ]),
     ('STSC_INVALID_SPC', lambda: applyPatch(getAtomDataPos('moov.trak.mdia.minf.stbl.stsc') + 4, struct.pack('>LLL', 1, 1, 0)), [

@@ -3,7 +3,7 @@
 
 // includes
 #include "mss_packager.h"
-#include "../mp4/mp4_parser.h"
+#include "../media_format.h"
 #include "../segmenter.h"
 
 // functions
@@ -18,6 +18,7 @@ vod_status_t mss_playready_get_fragment_writer(
 	request_context_t* request_context,
 	media_set_t* media_set,
 	uint32_t segment_index,
+	bool_t single_nalu_per_frame,
 	segment_writer_t* segment_writer,
 	const u_char* iv,
 	bool_t size_only,

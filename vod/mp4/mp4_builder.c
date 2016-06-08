@@ -1,4 +1,5 @@
 #include "mp4_builder.h"
+#include "mp4_defs.h"
 
 u_char*
 mp4_builder_write_mfhd_atom(u_char* p, uint32_t segment_index)
@@ -29,6 +30,7 @@ static u_char*
 mp4_builder_write_video_trun_atom(u_char* p, media_sequence_t* sequence, uint32_t first_frame_offset)
 {
 	media_clip_filtered_t* cur_clip;
+	frame_list_part_t* part;
 	input_frame_t* cur_frame;
 	input_frame_t* last_frame;
 	size_t atom_size;
@@ -42,10 +44,21 @@ mp4_builder_write_video_trun_atom(u_char* p, media_sequence_t* sequence, uint32_
 
 	for (cur_clip = sequence->filtered_clips; cur_clip < sequence->filtered_clips_end; cur_clip++)
 	{
-		cur_frame = cur_clip->first_track->first_frame;
-		last_frame = cur_clip->first_track->last_frame;
-		for (; cur_frame < last_frame; cur_frame++)
+		part = &cur_clip->first_track->frames;
+		last_frame = part->last_frame;
+		for (cur_frame = part->first_frame;; cur_frame++)
 		{
+			if (cur_frame >= last_frame)
+			{
+				if (part->next == NULL)
+				{
+					break;
+				}
+				part = part->next;
+				cur_frame = part->first_frame;
+				last_frame = part->last_frame;
+			}
+
 			write_be32(p, cur_frame->duration);
 			write_be32(p, cur_frame->size);
 			if (cur_frame->key_frame)
@@ -66,6 +79,7 @@ static u_char*
 mp4_builder_write_audio_trun_atom(u_char* p, media_sequence_t* sequence, uint32_t first_frame_offset)
 {
 	media_clip_filtered_t* cur_clip;
+	frame_list_part_t* part;
 	input_frame_t* cur_frame;
 	input_frame_t* last_frame;
 	size_t atom_size;
@@ -79,10 +93,21 @@ mp4_builder_write_audio_trun_atom(u_char* p, media_sequence_t* sequence, uint32_
 
 	for (cur_clip = sequence->filtered_clips; cur_clip < sequence->filtered_clips_end; cur_clip++)
 	{
-		cur_frame = cur_clip->first_track->first_frame;
-		last_frame = cur_clip->first_track->last_frame;
-		for (; cur_frame < last_frame; cur_frame++)
+		part = &cur_clip->first_track->frames;
+		last_frame = part->last_frame;
+		for (cur_frame = part->first_frame;; cur_frame++)
 		{
+			if (cur_frame >= last_frame)
+			{
+				if (part->next == NULL)
+				{
+					break;
+				}
+				part = part->next;
+				cur_frame = part->first_frame;
+				last_frame = part->last_frame;
+			}
+
 			write_be32(p, cur_frame->duration);
 			write_be32(p, cur_frame->size);
 		}
@@ -113,15 +138,14 @@ static void
 mp4_builder_init_track(fragment_writer_state_t* state, media_track_t* track)
 {
 	state->first_time = TRUE;
-	state->frames_source = track->frames_source;
-	state->frames_source_context = track->frames_source_context;
-	state->cur_frame = track->first_frame;
-	state->last_frame = track->last_frame;
-	state->cur_frame_offset = track->frame_offsets;
+	state->first_frame_part = &track->frames;
+	state->cur_frame_part = track->frames;
+	state->cur_frame = track->frames.first_frame;
 
 	if (!state->reuse_buffers)
 	{
-		state->frames_source->disable_buffer_reuse(state->frames_source_context);
+		state->cur_frame_part.frames_source->disable_buffer_reuse(
+			state->cur_frame_part.frames_source_context);
 	}
 }
 
@@ -158,6 +182,31 @@ mp4_builder_frame_writer_init(
 	return VOD_OK;
 }
 
+static bool_t
+mp4_builder_move_to_next_frame(fragment_writer_state_t* state)
+{
+	while (state->cur_frame >= state->cur_frame_part.last_frame)
+	{
+		if (state->cur_frame_part.next != NULL)
+		{
+			state->cur_frame_part = *state->cur_frame_part.next;
+			state->cur_frame = state->cur_frame_part.first_frame;
+			state->first_time = TRUE;
+			break;
+		}
+
+		state->cur_clip++;
+		if (state->cur_clip >= state->sequence->filtered_clips_end)
+		{
+			return FALSE;
+		}
+
+		mp4_builder_init_track(state, state->cur_clip->first_track);
+	}
+
+	return TRUE;
+}
+
 vod_status_t
 mp4_builder_frame_writer_process(fragment_writer_state_t* state)
 {
@@ -168,44 +217,26 @@ mp4_builder_frame_writer_process(fragment_writer_state_t* state)
 	vod_status_t rc;
 	bool_t frame_done;
 
+	if (!state->frame_started)
+	{
+		if (!mp4_builder_move_to_next_frame(state))
+		{
+			return VOD_OK;
+		}
+
+		rc = state->cur_frame_part.frames_source->start_frame(state->cur_frame_part.frames_source_context, state->cur_frame, ULLONG_MAX);
+		if (rc != VOD_OK)
+		{
+			return rc;
+		}
+
+		state->frame_started = TRUE;
+	}
+
 	for (;;)
 	{
-		while (state->cur_frame >= state->last_frame)
-		{
-			if (write_buffer != NULL)
-			{
-				// flush the write buffer
-				rc = state->write_callback(state->write_context, write_buffer, write_buffer_size);
-				if (rc != VOD_OK)
-				{
-					return rc;
-				}
-
-				write_buffer = NULL;
-			}
-
-			state->cur_clip++;
-			if (state->cur_clip >= state->sequence->filtered_clips_end)
-			{
-				return VOD_OK;
-			}
-
-			mp4_builder_init_track(state, state->cur_clip->first_track);
-		}
-
-		if (!state->frame_started)
-		{
-			rc = state->frames_source->start_frame(state->frames_source_context, state->cur_frame, *state->cur_frame_offset);
-			if (rc != VOD_OK)
-			{
-				return rc;
-			}
-
-			state->frame_started = TRUE;
-		}
-
 		// read some data from the frame
-		rc = state->frames_source->read(state->frames_source_context, &read_buffer, &read_size, &frame_done);
+		rc = state->cur_frame_part.frames_source->read(state->cur_frame_part.frames_source_context, &read_buffer, &read_size, &frame_done);
 		if (rc != VOD_OK)
 		{
 			if (rc != VOD_AGAIN)
@@ -233,33 +264,66 @@ mp4_builder_frame_writer_process(fragment_writer_state_t* state)
 			return VOD_AGAIN;
 		}
 
-		// move to the next frame if done
-		if (frame_done)
-		{
-			state->cur_frame++;
-			state->cur_frame_offset++;
-			state->frame_started = FALSE;
-		}
-
 		if (write_buffer != NULL)
 		{
 			// if the buffers are contiguous, just increment the size
 			if (!state->reuse_buffers && write_buffer + write_buffer_size == read_buffer)
 			{
 				write_buffer_size += read_size;
-				continue;
+			}
+			else
+			{
+				// buffers not contiguous, flush the write buffer
+				rc = state->write_callback(state->write_context, write_buffer, write_buffer_size);
+				if (rc != VOD_OK)
+				{
+					return rc;
+				}
+
+				// reset the write buffer
+				write_buffer = read_buffer;
+				write_buffer_size = read_size;
+			}
+		}
+		else
+		{
+			// reset the write buffer
+			write_buffer = read_buffer;
+			write_buffer_size = read_size;
+		}
+
+		if (!frame_done)
+		{
+			continue;
+		}
+
+		// move to the next frame
+		state->cur_frame++;
+
+		if (state->cur_frame >= state->cur_frame_part.last_frame)
+		{
+			if (write_buffer != NULL)
+			{
+				// flush the write buffer
+				rc = state->write_callback(state->write_context, write_buffer, write_buffer_size);
+				if (rc != VOD_OK)
+				{
+					return rc;
+				}
+
+				write_buffer = NULL;
 			}
 
-			// buffers not contiguous, flush the write buffer
-			rc = state->write_callback(state->write_context, write_buffer, write_buffer_size);
-			if (rc != VOD_OK)
+			if (!mp4_builder_move_to_next_frame(state))
 			{
-				return rc;
+				return VOD_OK;
 			}
 		}
 
-		// reset the write buffer
-		write_buffer = read_buffer;
-		write_buffer_size = read_size;
+		rc = state->cur_frame_part.frames_source->start_frame(state->cur_frame_part.frames_source_context, state->cur_frame, ULLONG_MAX);
+		if (rc != VOD_OK)
+		{
+			return rc;
+		}
 	}
 }

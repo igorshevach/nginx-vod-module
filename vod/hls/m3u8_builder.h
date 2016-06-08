@@ -2,7 +2,7 @@
 #define __M3U8_BUILDER_H__
 
 // includes
-#include "../mp4/mp4_parser.h"
+#include "../media_format.h"
 #include "../segmenter.h"
 #include "hls_muxer.h"
 
@@ -19,6 +19,8 @@ typedef struct {
 	vod_str_t index_file_name_prefix;
 	vod_str_t segment_file_name_prefix;
 	vod_str_t encryption_key_file_name;
+	vod_str_t encryption_key_format;
+	vod_str_t encryption_key_format_versions;
 } m3u8_config_t;
 
 // functions

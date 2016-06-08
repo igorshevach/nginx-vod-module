@@ -8,34 +8,16 @@
 #include "mp4_aes_ctr.h"
 
 // constants
-#define MP4_ENCRYPT_KEY_SIZE (16)
-#define MP4_ENCRYPT_KID_SIZE (16)
-#define MP4_ENCRYPT_SYSTEM_ID_SIZE (16)
-
 #define VOD_GUID_LENGTH (sizeof("00000000-0000-0000-0000-000000000000") - 1)
 
 // typedef
 struct mp4_encrypt_video_state_s;
 typedef struct mp4_encrypt_video_state_s mp4_encrypt_video_state_t;
 
-typedef vod_status_t (*mp4_encrypt_video_write_fragment_header_t)(mp4_encrypt_video_state_t* state);
-
-typedef struct {
-	u_char system_id[MP4_ENCRYPT_SYSTEM_ID_SIZE];
-	vod_str_t data;
-} mp4_encrypt_system_info_t;
-
-typedef struct {
-	uint32_t count;
-	mp4_encrypt_system_info_t* first;
-	mp4_encrypt_system_info_t* last;
-} mp4_encrypt_system_info_array_t;
-
-typedef struct {
-	u_char key_id[MP4_ENCRYPT_KID_SIZE];
-	u_char key[MP4_ENCRYPT_KEY_SIZE];
-	mp4_encrypt_system_info_array_t pssh_array;
-} mp4_encrypt_info_t;
+typedef vod_status_t (*mp4_encrypt_video_build_fragment_header_t)(
+	mp4_encrypt_video_state_t* state, 
+	vod_str_t* header, 
+	size_t* total_fragment_size);
 
 typedef struct {
 	segment_writer_t segment_writer;
@@ -57,6 +39,8 @@ typedef struct {
 
 	// frame state
 	media_clip_filtered_t* cur_clip;
+
+	frame_list_part_t* cur_frame_part;
 	input_frame_t* cur_frame;
 	input_frame_t* last_frame;
 	uint32_t frame_size_left;
@@ -70,7 +54,7 @@ struct mp4_encrypt_video_state_s {
 	mp4_encrypt_state_t base;
 
 	// fixed
-	mp4_encrypt_video_write_fragment_header_t write_fragment_header;
+	mp4_encrypt_video_build_fragment_header_t build_fragment_header;
 	uint32_t nal_packet_size_length;
 
 	// auxiliary data state
@@ -83,6 +67,7 @@ struct mp4_encrypt_video_state_s {
 	int cur_state;
 	uint32_t length_bytes_left;
 	uint32_t packet_size_left;
+	bool_t single_nalu_warning_printed;
 
 	// saiz / saio
 	u_char default_auxiliary_sample_size;
@@ -97,9 +82,12 @@ vod_status_t mp4_encrypt_video_get_fragment_writer(
 	request_context_t* request_context,
 	media_set_t* media_set,
 	uint32_t segment_index,
-	mp4_encrypt_video_write_fragment_header_t write_fragment_header,
+	bool_t single_nalu_per_frame,
+	mp4_encrypt_video_build_fragment_header_t build_fragment_header,
 	segment_writer_t* segment_writer,
-	const u_char* iv);
+	const u_char* iv, 
+	vod_str_t* fragment_header,
+	size_t* total_fragment_size);
 
 vod_status_t mp4_encrypt_audio_get_fragment_writer(
 	segment_writer_t* result,
